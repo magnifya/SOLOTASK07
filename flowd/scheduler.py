@@ -59,6 +59,49 @@ def normalize_max_parallelism(value):
     return int(value)
 
 
+def normalize_idempotency_key(value):
+    """Validate an optional idempotency key.
+
+    ``None`` disables idempotent creation; otherwise the value must be a
+    string that stays non-empty after trimming (the trimmed key is the
+    dedupe key).
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise WorkflowError("idempotency_key must be a string", "bad_idempotency_key")
+    value = value.strip()
+    if not value:
+        raise WorkflowError("idempotency_key must be a non-empty string", "bad_idempotency_key")
+    return value
+
+
+def normalize_params(value):
+    """Validate ``params`` for an idempotent run: an object, or ``None`` -> {}."""
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise WorkflowError("params must be a JSON object", "bad_params")
+    return dict(value)
+
+
+def json_equal(left, right):
+    """Semantic JSON equality: object key order ignored, array order kept.
+
+    Booleans are distinct from numbers (``True`` does not equal ``1``);
+    numbers compare by numeric value.
+    """
+    if isinstance(left, bool) or isinstance(right, bool):
+        return isinstance(left, bool) and isinstance(right, bool) and left == right
+    if isinstance(left, dict) and isinstance(right, dict):
+        return set(left) == set(right) and all(json_equal(left[k], right[k]) for k in left)
+    if isinstance(left, list) and isinstance(right, list):
+        return len(left) == len(right) and all(json_equal(a, b) for a, b in zip(left, right))
+    if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+        return float(left) == float(right)
+    return left == right
+
+
 def _active_lease_count(run, now):
     """Count ordinary tasks in this run holding a strictly unexpired lease.
 
@@ -136,15 +179,50 @@ class Scheduler:
     def submit(self, tenant, workflow_id, steps):
         return self.store.save_workflow(tenant, workflow_id, steps)
 
-    def start_run(self, tenant, workflow_id, run_id=None, params=None, max_parallelism=None):
+    def start_run(self, tenant, workflow_id, run_id=None, params=None, max_parallelism=None,
+                  idempotency_key=None):
+        """Create a run, or return the existing one for a repeated idempotency key.
+
+        With ``idempotency_key`` omitted/``None`` this keeps the original
+        create-only behaviour.  With a key, a repeat under the same tenant
+        returns the original run unchanged when workflow_id/params/quota
+        match (an omitted or explicit-but-different ``run_id`` is reused or
+        rejected), and raises :class:`ConflictError` when valid content
+        differs.  All validation happens before any workflow lookup, so a
+        new key against an unknown workflow is a 404, never a 400/409.
+        """
+        key = normalize_idempotency_key(idempotency_key)
         max_parallelism = normalize_max_parallelism(max_parallelism)
-        plan = self.store.get_workflow(tenant, workflow_id)
+        if key is not None:
+            params = normalize_params(params)
+            if run_id is not None and not isinstance(run_id, str):
+                raise WorkflowError("run_id must be a string", "bad_run_id")
+            if isinstance(run_id, str) and not run_id.strip():
+                run_id = None  # blank is treated as omitted, like unkeyed creates
         with self.store.locked():
-            run_id = run_id or self.store.generate_run_id()
+            if key is not None:
+                records = self.store.load_idempotency(tenant)
+                record = records.get(key)
+                if record is not None:
+                    if not self._idempotent_request_matches(record, workflow_id, params,
+                                                            max_parallelism, run_id):
+                        raise ConflictError(
+                            "idempotency_key %s was already used with different content" % key,
+                            "idempotency_conflict",
+                        )
+                    return self.store.load_run(tenant, record["run_id"])
+            # A new key (or an unkeyed create) needs the workflow to exist
+            # now.  A keyed hit above never re-reads the workflow, so
+            # overwriting a same-named workflow cannot change the result.
+            plan = self.store.get_workflow(tenant, workflow_id)
+            if key is None:
+                run_id = run_id or self.store.generate_run_id()
+            elif run_id is None:
+                run_id = self.store.generate_run_id()
             if self.store.run_exists(run_id) == tenant:
                 raise WorkflowError("run already exists: %s" % run_id, "duplicate_run")
             run = new_run(tenant, workflow_id, run_id, params, plan, self._iso(),
-                          max_parallelism=max_parallelism)
+                          max_parallelism=max_parallelism, idempotency_key=key)
             self._event(run, run_id, None, "run_created")
             ready, waiting = _promote_pending(run, self._iso())
             for sid in ready:
@@ -152,7 +230,25 @@ class Scheduler:
             for sid in waiting:
                 self._event(run, run_id, sid, "waiting", attempt=0)
             run["status"], run["updated_at"] = _derive_run_status(run), self._iso()
-            return self.store.save_run(run)
+            self.store.save_run(run)
+            if key is not None:
+                records[key] = {"run_id": run_id, "workflow_id": workflow_id,
+                                "params": run["params"], "max_parallelism": max_parallelism}
+                self.store.save_idempotency(tenant, records)
+            return run
+
+    @staticmethod
+    def _idempotent_request_matches(record, workflow_id, params, max_parallelism, run_id):
+        """Whether a repeated request carries the same content as the first."""
+        if workflow_id != record["workflow_id"]:
+            return False
+        if not json_equal(params, record.get("params") or {}):
+            return False
+        if max_parallelism != record.get("max_parallelism"):
+            return False
+        if run_id is not None and run_id != record["run_id"]:
+            return False
+        return True
 
     def get_run(self, tenant, run_id):
         run = self.store.load_run(tenant, run_id)
@@ -410,7 +506,8 @@ class Scheduler:
         plan = self.store.get_workflow(tenant, stored["workflow_id"])
         rebuilt = new_run(tenant, stored["workflow_id"], run_id, stored.get("params"), plan,
                           stored["created_at"],
-                          max_parallelism=stored.get("max_parallelism"))
+                          max_parallelism=stored.get("max_parallelism"),
+                          idempotency_key=stored.get("idempotency_key"))
         steps = rebuilt["steps"]
         for event in stored["history"]:
             sid, etype, at = event.get("step_id"), event.get("type"), event.get("at")

@@ -84,6 +84,9 @@ class WorkflowStore:
     def workflows_path(self, tenant):
         return os.path.join(self.tenant_dir(tenant), "workflows.json")
 
+    def idempotency_path(self, tenant):
+        return os.path.join(self.tenant_dir(tenant), "idempotency.json")
+
     def run_path(self, tenant, run_id):
         return os.path.join(self.tenant_dir(tenant), "runs", "%s.json" % run_id)
 
@@ -101,6 +104,13 @@ class WorkflowStore:
 
     def load_workflows(self, tenant):
         return read_json(self.workflows_path(tenant), {}) or {}
+
+    def load_idempotency(self, tenant):
+        """Return the tenant's persisted ``key -> record`` idempotency index."""
+        return read_json(self.idempotency_path(tenant), {}) or {}
+
+    def save_idempotency(self, tenant, records):
+        atomic_write_json(self.idempotency_path(tenant), records)
 
     def get_workflow(self, tenant, workflow_id):
         plan = self.load_workflows(tenant).get(workflow_id)
@@ -149,16 +159,20 @@ def normalize_run(run):
 
     Steps without ``kind`` predate approval nodes and are ordinary tasks.
     Runs without ``max_parallelism`` predate per-run concurrency quotas and
-    have no limit (``None``).  Mutates and returns ``run``.
+    have no limit (``None``).  Runs without ``idempotency_key`` predate
+    tenant-scoped idempotent creation and report ``None`` (they never
+    participate in key based dedupe).  Mutates and returns ``run``.
     """
     run.setdefault("max_parallelism", None)
+    run.setdefault("idempotency_key", None)
     for step in run.get("steps", {}).values():
         step.setdefault("kind", KIND_TASK)
         step.setdefault("approval", None)
     return run
 
 
-def new_run(tenant, workflow_id, run_id, params, plan, now_iso, max_parallelism=None):
+def new_run(tenant, workflow_id, run_id, params, plan, now_iso, max_parallelism=None,
+            idempotency_key=None):
     """Build a fresh run document from a validated plan."""
     steps = {
         step["id"]: {
@@ -187,6 +201,7 @@ def new_run(tenant, workflow_id, run_id, params, plan, now_iso, max_parallelism=
         "status": RUN_PENDING,
         "params": params or {},
         "max_parallelism": max_parallelism,
+        "idempotency_key": idempotency_key,
         "created_at": now_iso,
         "updated_at": now_iso,
         "step_order": list(plan["order"]),

@@ -7,9 +7,9 @@ takeover, retries with exponential backoff, idempotent completion, human
 a small JSON HTTP API. Standard library only: no pip installs, no network
 access, no third-party imports.
 
-Data lives in a single directory: `<root>/<tenant>/workflows.json` plus
-`<root>/<tenant>/runs/<run_id>.json`, written atomically, so restarting the
-process sees exactly the same state.
+Data lives in a single directory: `<root>/<tenant>/workflows.json`,
+`<root>/<tenant>/idempotency.json` plus `<root>/<tenant>/runs/<run_id>.json`,
+written atomically, so restarting the process sees exactly the same state.
 
 ## Run
 
@@ -46,7 +46,7 @@ the only accepted values are `task` and `approval`.
 | --- | --- | --- | --- |
 | GET | `/healthz` | 200 `{"ok":true}` | - |
 | POST | `/v1/workflows` | 201 validated plan | 400 validation error, 400 bad JSON |
-| POST | `/v1/runs` | 201 run | 400 bad request/max_parallelism, 404 unknown workflow |
+| POST | `/v1/runs` | 201 run | 400 bad request/max_parallelism/idempotency_key/params, 404 unknown workflow, 409 idempotency key reused with different content |
 | GET | `/v1/runs/{run_id}?tenant=` | 200 run with step states | 400 missing tenant, 403 cross-tenant, 404 unknown run |
 | POST | `/v1/runs/{run_id}/claim` | 200 `{"step":...}`, 204 nothing ready | 400 bad request, 403 cross-tenant, 404 unknown run |
 | POST | `/v1/runs/{run_id}/complete` | 200 updated run | 400 bad request, 403, 404 unknown step, 409 lease not held/expired |
@@ -79,6 +79,52 @@ takes or releases a slot. When the quota is full, `Scheduler.claim` returns
 JSON: ready tasks stay ready and no claim history is appended (takeover
 entries from leases reclaimed by the same call are still recorded). Quotas
 are counted per `run_id`, so runs and tenants never share slots.
+
+### Tenant-scoped idempotent run creation
+
+`POST /v1/runs` (and `Scheduler.start_run`) accept an optional
+`idempotency_key`. Omit it or pass `null` for the existing create-a-new-run
+behavior; otherwise the value must be a string that is non-empty after
+trimming, and the trimmed string is the dedupe key. Keys are scoped per
+tenant: the same key in two tenants creates two independent runs.
+
+The first request with a `(tenant, key)` pair creates the run and records
+the key alongside the creation content (`workflow_id`, `params`,
+`max_parallelism`). A later request with the same key returns that same run
+with its *latest* state — pending, running, succeeded or failed — with HTTP
+**201** both times; no new `run_id` is generated, no steps are reset, no
+history is appended and `updated_at`, leases, approvals and quotas are all
+untouched. The index (`<root>/<tenant>/idempotency.json`) is written
+atomically, so keys survive a restart against the same data directory.
+
+When a key is present, `params` must be a JSON object (omitted or `null`
+means `{}`). Content comparison is semantic: object key order is ignored,
+array order is preserved, booleans are distinct from numbers (`true` ≠ `1`)
+and numbers compare by numeric value (`1` equals `1.0`). `workflow_id`,
+`params` and `max_parallelism` must match the first creation, where an
+omitted or `null` quota means unlimited (so it does not match a numeric
+quota). A repeated request that omits `run_id` reuses the original; an
+explicit `run_id` must equal it.
+
+Validation wins over every other outcome: an illegal key, non-object
+`params` or bad quota raises `WorkflowError` (HTTP **400**) before any
+workflow lookup, so even an unknown workflow returns 400 for malformed
+input. Legal-but-different content raises `ConflictError` (HTTP **409**);
+a brand-new key for an unknown workflow raises `WorkflowError` (HTTP
+**404**). Rejections never create a run or modify the original. Once a key
+has been recorded, matching requests reuse the run without consulting the
+workflow definition again, so deleting or overwriting the same-named
+workflow cannot change reuse (only content comparison can 409).
+
+Requests sharing one `WorkflowStore` are serialized through its lock, so
+concurrent sends of the same `(tenant, key)` create exactly one run:
+identical content all reuses it, and with differing content only the
+first-created request is accepted while the rest get 409.
+
+The key is reported as `idempotency_key` on the create response (including
+repeats), run details, the run listing, `flowd status` and
+`Scheduler.replay`. Run documents written by older versions lack the field
+and read back as `null`; such runs never participate in key dedupe.
 
 ### Approval decisions
 
