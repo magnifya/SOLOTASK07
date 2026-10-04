@@ -5,6 +5,7 @@ history stays the single source of truth.  ``replay`` rebuilds current state
 from that history and must agree with the stored document.
 """
 
+import math
 import time as _time
 
 from .model import KIND_APPROVAL, WorkflowError, format_time
@@ -176,13 +177,61 @@ class Scheduler:
                 step.update(status=STEP_RUNNING, worker_id=worker_id, next_attempt_at=None,
                             lease_deadline=now + float(lease_seconds), started_at=self._iso())
                 self._event(run, run_id, step["id"], "claim", attempt=step["attempt"],
-                            worker_id=worker_id)
+                            worker_id=worker_id, lease_deadline=step["lease_deadline"])
             run["status"] = _derive_run_status(run)
             if step is not None and run["status"] == RUN_RUNNING and previous == RUN_PENDING:
                 self._event(run, run_id, None, "run_started")
             run["updated_at"] = self._iso()
             self.store.save_run(run)
             return dict(step) if step is not None else None
+
+    def heartbeat(self, tenant, run_id, step_id, worker_id, lease_seconds=30):
+        """Renew the lease on a running step held by ``worker_id``.
+
+        The new deadline is the later of the current one and
+        ``now + lease_seconds``; only the deadline and ``updated_at`` change.
+        A renewal that would not extend the deadline returns the run
+        unchanged and appends no history.
+        """
+        if not isinstance(worker_id, str) or not worker_id.strip():
+            raise WorkflowError("worker_id must be a non-empty string", "bad_worker")
+        if not isinstance(step_id, str) or not step_id.strip():
+            raise WorkflowError("step_id must be a non-empty string", "bad_step")
+        if not isinstance(lease_seconds, (int, float)) or isinstance(lease_seconds, bool) \
+                or not math.isfinite(lease_seconds) or lease_seconds <= 0:
+            raise WorkflowError("lease_seconds must be a positive number", "bad_lease")
+        now = self.now()
+        with self.store.locked():
+            owner = self.store.run_exists(run_id)
+            if owner is not None and owner != tenant:
+                raise WorkflowError("run %s belongs to another tenant" % run_id, "cross_tenant")
+            run = self.get_run(tenant, run_id)
+            if run["status"] in (RUN_SUCCEEDED, RUN_FAILED):
+                raise ConflictError("run %s is already %s" % (run_id, run["status"]),
+                                    "run_finished")
+            step = run["steps"].get(step_id)
+            if step is None:
+                raise WorkflowError("unknown step: %s" % step_id, "unknown_step")
+            if step.get("kind") == KIND_APPROVAL:
+                raise ConflictError(
+                    "step %s is an approval node; use /decision" % step_id, "not_a_task"
+                )
+            if step["status"] != STEP_RUNNING:
+                raise LeaseError("step %s is not running" % step_id, "lease_not_held")
+            if step["worker_id"] != worker_id:
+                raise LeaseError("step %s lease is not held by worker %s" % (step_id, worker_id))
+            deadline = float(step["lease_deadline"])
+            if now >= deadline:
+                raise LeaseError("lease for step %s expired" % step_id, "lease_expired")
+            new_deadline = max(deadline, now + float(lease_seconds))
+            if new_deadline <= deadline:
+                return run
+            step["lease_deadline"] = new_deadline
+            self._event(run, run_id, step_id, "heartbeat", attempt=step["attempt"],
+                        worker_id=worker_id, lease_deadline=new_deadline)
+            run["updated_at"] = self._iso()
+            self.store.save_run(run)
+            return run
 
     def _require_lease(self, run, step_id, worker_id):
         step = run["steps"].get(step_id)
@@ -344,7 +393,10 @@ class Scheduler:
             elif etype == "waiting":
                 step.update(status=STEP_WAITING)
             elif etype == "claim":
-                step.update(status=STEP_RUNNING, worker_id=event.get("worker_id"), started_at=at)
+                step.update(status=STEP_RUNNING, worker_id=event.get("worker_id"),
+                            started_at=at, lease_deadline=event.get("lease_deadline"))
+            elif etype == "heartbeat":
+                step["lease_deadline"] = event.get("lease_deadline")
             elif etype == "takeover":
                 step.update(status=STEP_READY, worker_id=None, lease_deadline=None)
             elif etype == "complete":
@@ -357,7 +409,7 @@ class Scheduler:
                             approval={"actor": event.get("actor"),
                                       "decision": event.get("decision"), "at": at})
             elif etype == "fail":
-                step.update(error=event.get("error"),
+                step.update(error=event.get("error"), worker_id=None, lease_deadline=None,
                             attempt=step["attempt"] if attempt is None else attempt)
             elif etype == "retry":
                 step["status"] = STEP_READY

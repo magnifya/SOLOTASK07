@@ -176,6 +176,86 @@ class HttpTest(unittest.TestCase):
         self.assertEqual(status, 404)
         self.assertIn("error", body)
 
+    def heartbeat(self, run_id="r1", tenant="acme", step_id="step1", worker="w1",
+                  lease="omit"):
+        body = {"tenant": tenant, "step_id": step_id, "worker_id": worker}
+        if lease != "omit":
+            body["lease_seconds"] = lease
+        return self.call("POST", "/v1/runs/%s/heartbeat" % run_id, body)
+
+    def test_heartbeat_renews_lease(self):
+        self.submit_workflow()
+        self.start_run(run_id="r1")
+        self.claim(lease=60)
+        status, body = self.heartbeat(lease=3600)
+        self.assertEqual(status, 200)
+        step = body["steps"][0]
+        self.assertEqual((step["status"], step["worker_id"]), ("running", "w1"))
+        self.assertGreater(step["lease_deadline"], 3600)
+        self.assertEqual(body["history_length"], 5)  # created, ready, claim, started, heartbeat
+        status, again = self.heartbeat(lease=1)  # would shorten -> no-op
+        self.assertEqual(status, 200)
+        self.assertEqual(again["steps"][0]["lease_deadline"], step["lease_deadline"])
+        self.assertEqual(again["history_length"], 5)
+        status, fetched = self.call("GET", "/v1/runs/r1?tenant=acme")
+        self.assertEqual(fetched["steps"][0]["lease_deadline"], step["lease_deadline"])
+
+    def test_heartbeat_default_lease_is_thirty_seconds(self):
+        self.submit_workflow()
+        self.start_run(run_id="r1")
+        self.claim(lease=5)
+        status, body = self.heartbeat()
+        self.assertEqual(status, 200)
+        self.assertGreater(body["steps"][0]["lease_deadline"], 30)
+
+    def test_heartbeat_rejects_bad_requests(self):
+        self.submit_workflow()
+        self.start_run(run_id="r1")
+        self.claim()
+        for payload in ({"tenant": "acme", "step_id": "step1"},  # missing worker
+                        {"tenant": "acme", "step_id": "step1", "worker_id": ""},
+                        {"tenant": "acme", "step_id": "  ", "worker_id": "w1"},
+                        {"tenant": "acme", "step_id": "step1", "worker_id": "w1",
+                         "lease_seconds": 0},
+                        {"tenant": "acme", "step_id": "step1", "worker_id": "w1",
+                         "lease_seconds": True},
+                        {"tenant": "acme", "step_id": "step1", "worker_id": "w1",
+                         "lease_seconds": None},
+                        {"tenant": "acme", "step_id": "step1", "worker_id": "w1",
+                         "lease_seconds": "30"}):
+            status, body = self.call("POST", "/v1/runs/r1/heartbeat", payload)
+            self.assertEqual(status, 400, payload)
+            self.assertIn("error", body)
+        status, body = self.call("POST", "/v1/runs/r1/heartbeat", raw_body=b"{not json")
+        self.assertEqual(status, 400)
+        status, body = self.call("POST", "/v1/runs/r1/heartbeat", raw_body=b"[1, 2]")
+        self.assertEqual(status, 400)
+
+    def test_heartbeat_not_found_and_cross_tenant(self):
+        self.submit_workflow()
+        self.start_run(run_id="r1")
+        self.claim()
+        self.assertEqual(self.heartbeat(run_id="nope")[0], 404)
+        self.assertEqual(self.heartbeat(step_id="ghost")[0], 404)
+        self.assertEqual(self.heartbeat(tenant="globex")[0], 403)
+
+    def test_heartbeat_conflicts(self):
+        self.submit_workflow()
+        self.start_run(run_id="r1")
+        self.assertEqual(self.heartbeat()[0], 409)  # step not running
+        self.claim()
+        self.assertEqual(self.heartbeat(worker="w2")[0], 409)  # wrong holder
+        self.complete("step1")
+        for sid in ("step2", "step3"):
+            self.claim()
+            self.complete(sid)
+        self.assertEqual(self.heartbeat()[0], 409)  # run finished
+
+    def test_heartbeat_rejects_approval_node(self):
+        self.submit_workflow(workflow_id="gate", steps=[{"id": "ok", "kind": "approval"}])
+        self.start_run(workflow_id="gate", run_id="r9")
+        self.assertEqual(self.heartbeat(run_id="r9", step_id="ok")[0], 409)
+
 
 if __name__ == "__main__":
     unittest.main()

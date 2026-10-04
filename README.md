@@ -52,6 +52,7 @@ the only accepted values are `task` and `approval`.
 | POST | `/v1/runs/{run_id}/complete` | 200 updated run | 400 bad request, 403, 404 unknown step, 409 lease not held/expired |
 | POST | `/v1/runs/{run_id}/fail` | 200 updated run | 400 bad request, 403, 404 unknown step, 409 lease not held/expired |
 | POST | `/v1/runs/{run_id}/decision` | 200 updated run | 400 bad request/JSON, 403 cross-tenant, 404 unknown run/step, 409 not an approval/not waiting/already decided |
+| POST | `/v1/runs/{run_id}/heartbeat` | 200 updated run | 400 bad request/JSON, 403 cross-tenant, 404 unknown run/step, 409 finished run/approval node/lease not held/expired |
 | GET | `/v1/runs?tenant=&status=&limit=&after=` | 200 `{"items":[...],"next_after":...}` | 400 missing tenant |
 
 Errors are always `{"error": "<message>"}`.
@@ -95,6 +96,12 @@ approval steps instead go `pending` -> `waiting` -> `succeeded` | `failed`.
   node and promotes successors; `reject` fails the node and the whole run.
 - A lease past its deadline is reclaimed on the next `claim`, which records a
   `takeover` history entry naming the previous holder.
+- `heartbeat` (`{"tenant","step_id","worker_id","lease_seconds"?}`, default 30s)
+  renews the lease on a `running` task held by the caller: the deadline becomes
+  the later of its current value and `now + lease_seconds`. Only the deadline
+  and `updated_at` change; a renewal that would not extend the deadline is a
+  no-op that appends no history. Heartbeats against finished runs or approval
+  nodes, foreign leases and expired deadlines are rejected with 409.
 - Claim order is deterministic: `(topological index, step id)`, at most one active
   lease per step.
 
@@ -107,7 +114,8 @@ Run states: `pending` -> `running` -> `succeeded` | `failed`.
 
 Every transition appends `{"at","run_id","step_id","type","attempt","worker_id"}`
 to the run's append-only history (a `decision` event additionally carries
-`actor` and `decision`); `Scheduler.replay(run_id)` rebuilds the current
+`actor` and `decision`; `claim` and `heartbeat` events carry the
+`lease_deadline`); `Scheduler.replay(run_id)` rebuilds the current
 states from that history and agrees with the stored document.
 
 ## Layout

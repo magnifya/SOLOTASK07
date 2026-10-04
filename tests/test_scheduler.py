@@ -6,7 +6,7 @@ import tempfile
 import unittest
 
 from flowd.model import WorkflowError
-from flowd.scheduler import LeaseError, Scheduler, backoff_seconds
+from flowd.scheduler import ConflictError, LeaseError, Scheduler, backoff_seconds
 from flowd.store import WorkflowStore
 
 LINEAR = [
@@ -266,6 +266,146 @@ class TenancyTest(SchedulerTestBase):
         self.assertEqual(len(page2), 1)
         self.assertIsNone(next_after2)
         self.assertEqual(self.scheduler.list_runs("acme", status="failed")[0], [])
+
+
+class HeartbeatTest(SchedulerTestBase):
+    def setUp(self):
+        super().setUp()
+        self.workflow()
+        self.run = self.scheduler.start_run("acme", "etl")
+        self.run_id = self.run["run_id"]
+        self.claim(self.run_id, "w1", lease=30)
+
+    def heartbeat(self, step_id="step1", worker="w1", lease=30, tenant="acme"):
+        return self.scheduler.heartbeat(tenant, self.run_id, step_id, worker, lease)
+
+    def test_heartbeat_extends_deadline_and_appends_event(self):
+        self.clock.advance(10)
+        run = self.heartbeat(lease=60)
+        step = run["steps"]["step1"]
+        self.assertEqual(step["lease_deadline"], self.clock.value + 60)
+        self.assertEqual((step["status"], step["worker_id"], step["attempt"]),
+                         ("running", "w1", 0))
+        events = [e for e in run["history"] if e["type"] == "heartbeat"]
+        self.assertEqual(len(events), 1)
+        event = events[0]
+        self.assertEqual(event["lease_deadline"], step["lease_deadline"])
+        self.assertTrue({"at", "run_id", "step_id", "type", "attempt", "worker_id"}
+                        .issubset(set(event)))
+        self.assertEqual((event["step_id"], event["worker_id"]), ("step1", "w1"))
+
+    def test_heartbeat_defaults_to_thirty_seconds(self):
+        run = self.scheduler.heartbeat("acme", self.run_id, "step1", "w1")
+        self.assertEqual(run["steps"]["step1"]["lease_deadline"], self.clock.value + 30)
+
+    def test_heartbeat_keeps_later_existing_deadline(self):
+        before = self.scheduler.get_run("acme", self.run_id)
+        deadline = before["steps"]["step1"]["lease_deadline"]
+        history_len = len(before["history"])
+        run = self.heartbeat(lease=10)  # now + 10 < current deadline (now + 30)
+        step = run["steps"]["step1"]
+        self.assertEqual(step["lease_deadline"], deadline)
+        self.assertEqual(run["updated_at"], before["updated_at"])
+        self.assertEqual(len(run["history"]), history_len)
+
+    def test_heartbeat_does_not_unlock_successors(self):
+        self.heartbeat(lease=60)
+        run = self.scheduler.get_run("acme", self.run_id)
+        self.assertEqual(run["steps"]["step2"]["status"], "pending")
+        self.assertIsNone(self.claim(self.run_id, "w2"))
+
+    def test_heartbeat_prevents_takeover_until_new_deadline(self):
+        self.clock.advance(20)
+        self.heartbeat(lease=60)  # deadline now original-now+20+60
+        self.clock.advance(35)  # past the original 30s deadline
+        self.assertIsNone(self.claim(self.run_id, "w2", lease=5))
+        self.clock.advance(30)  # past the extended deadline
+        taken = self.claim(self.run_id, "w2", lease=5)
+        self.assertEqual((taken["id"], taken["worker_id"]), ("step1", "w2"))
+
+    def test_heartbeat_rejects_terminal_run(self):
+        self.complete(self.run_id, "step1")
+        for _ in range(2):
+            self.finish_next(self.run_id)
+        self.assertEqual(self.scheduler.get_run("acme", self.run_id)["status"], "succeeded")
+        with self.assertRaises(ConflictError):
+            self.heartbeat()
+
+    def test_heartbeat_rejects_approval_step(self):
+        self.scheduler.submit("acme", "gate", [{"id": "ok", "kind": "approval"}])
+        run = self.scheduler.start_run("acme", "gate")
+        with self.assertRaises(ConflictError):
+            self.scheduler.heartbeat("acme", run["run_id"], "ok", "w1", 30)
+
+    def test_heartbeat_rejects_non_running_step(self):
+        with self.assertRaises(LeaseError):
+            self.heartbeat("step2")  # still pending
+        self.complete(self.run_id, "step1")
+        with self.assertRaises(LeaseError):
+            self.heartbeat("step1")  # already succeeded
+
+    def test_heartbeat_rejects_wrong_worker_and_expired_lease(self):
+        with self.assertRaises(LeaseError):
+            self.heartbeat(worker="w2")
+        self.clock.advance(30)  # deadline reached
+        with self.assertRaises(LeaseError):
+            self.heartbeat()
+
+    def test_heartbeat_rejects_unknown_run_step_and_cross_tenant(self):
+        with self.assertRaises(WorkflowError):
+            self.scheduler.heartbeat("acme", "nope", "step1", "w1", 30)
+        with self.assertRaises(WorkflowError):
+            self.heartbeat("ghost")
+        with self.assertRaises(WorkflowError):
+            self.heartbeat(tenant="globex")
+
+    def test_heartbeat_validates_arguments(self):
+        for bad_worker in (None, 5, "", "   "):
+            with self.assertRaises(WorkflowError):
+                self.heartbeat(worker=bad_worker)
+        for bad_lease in (None, True, 0, -1, float("inf"), float("nan"), "30"):
+            with self.assertRaises(WorkflowError):
+                self.heartbeat(lease=bad_lease)
+
+    def test_rejected_heartbeat_changes_nothing(self):
+        before = self.scheduler.get_run("acme", self.run_id)
+        for call in (lambda: self.heartbeat(worker="w2"),
+                     lambda: self.heartbeat("ghost"),
+                     lambda: self.heartbeat(lease=-1)):
+            with self.assertRaises(WorkflowError):
+                call()
+        after = self.scheduler.get_run("acme", self.run_id)
+        self.assertEqual(after, before)
+
+    def test_replay_matches_stored_state_through_heartbeat_and_takeover(self):
+        self.clock.advance(10)
+        self.heartbeat(lease=100)
+        stored = self.scheduler.get_run("acme", self.run_id)
+        replayed = self.scheduler.replay("acme", self.run_id)
+        for doc in (replayed, stored):
+            self.assertEqual(doc["status"], "running")
+        step = replayed["steps"]["step1"]
+        self.assertEqual((step["worker_id"], step["lease_deadline"], step["attempt"]),
+                         ("w1", stored["steps"]["step1"]["lease_deadline"], 0))
+        self.clock.advance(200)  # extended lease expires, w2 takes over
+        taken = self.claim(self.run_id, "w2", lease=15)
+        self.assertEqual(taken["worker_id"], "w2")
+        stored = self.scheduler.get_run("acme", self.run_id)
+        replayed = self.scheduler.replay("acme", self.run_id)
+        for doc in (replayed, stored):
+            step = doc["steps"]["step1"]
+            self.assertEqual((step["status"], step["worker_id"],
+                              step["lease_deadline"], step["attempt"]),
+                             ("running", "w2", self.clock.value + 15, 0))
+
+    def test_heartbeat_survives_a_fresh_store(self):
+        self.clock.advance(10)
+        self.heartbeat(lease=90)
+        restarted = Scheduler(WorkflowStore(self.root, clock=self.clock), clock=self.clock)
+        step = restarted.get_run("acme", self.run_id)["steps"]["step1"]
+        self.assertEqual(step["lease_deadline"], self.clock.value + 90)
+        self.clock.advance(50)  # original 30s deadline gone, renewal still holds
+        self.assertIsNone(restarted.claim("acme", self.run_id, "w2", 5))
 
 
 class PersistenceTest(SchedulerTestBase):
