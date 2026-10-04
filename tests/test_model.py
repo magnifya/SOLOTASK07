@@ -63,6 +63,20 @@ class ValidationTest(unittest.TestCase):
                 plan_workflow("w", [{"id": "a", "max_attempts": bad}])
             self.assertEqual(ctx.exception.code, "bad_max_attempts", "value %r" % (bad,))
 
+    def test_kind_defaults_to_task(self):
+        plan = plan_workflow("w", steps(("a", [])))
+        self.assertEqual(plan["steps"][0]["kind"], "task")
+
+    def test_approval_kind_accepted(self):
+        plan = plan_workflow("w", [{"id": "a", "depends_on": [], "kind": " approval "}])
+        self.assertEqual(plan["steps"][0]["kind"], "approval")
+
+    def test_bad_kind_rejected(self):
+        for bad in ("gate", "TASK", "", "  ", 5, 2.0, True, ["approval"]):
+            with self.assertRaises(WorkflowError) as ctx:
+                plan_workflow("w", [{"id": "a", "depends_on": [], "kind": bad}])
+            self.assertEqual(ctx.exception.code, "bad_kind", "value %r" % (bad,))
+
     def test_duplicate_dependency_rejected(self):
         with self.assertRaises(WorkflowError):
             plan_workflow("w", steps(("a", []), ("b", ["a", "a"])))

@@ -9,6 +9,7 @@ import time as _time
 
 from .model import WorkflowError, format_time
 from .store import (
+    KIND_APPROVAL,
     RUN_FAILED,
     RUN_PENDING,
     RUN_RUNNING,
@@ -18,9 +19,14 @@ from .store import (
     STEP_READY,
     STEP_RUNNING,
     STEP_SUCCEEDED,
+    STEP_WAITING,
     WorkflowStore,
     new_run,
 )
+
+DECISION_APPROVE = "approve"
+DECISION_REJECT = "reject"
+DECISIONS = (DECISION_APPROVE, DECISION_REJECT)
 
 
 class LeaseError(WorkflowError):
@@ -30,21 +36,50 @@ class LeaseError(WorkflowError):
         super().__init__(message, code)
 
 
+class ConflictError(WorkflowError):
+    """Raised when a request conflicts with the current step state."""
+
+    def __init__(self, message, code="conflict"):
+        super().__init__(message, code)
+
+
 def backoff_seconds(attempt, base=1.0):
     """Exponential backoff: ``base * 2 ** (attempt - 1)``."""
     return float(base) * (2 ** (max(1, int(attempt)) - 1))
 
 
+def _deps_succeeded(run, step):
+    return all(run["steps"][d]["status"] == STEP_SUCCEEDED for d in step["depends_on"])
+
+
 def _refresh_ready(run, now_iso):
-    """Promote pending steps whose dependencies all succeeded."""
+    """Promote pending task steps whose dependencies all succeeded."""
     index = run["order_index"]
     moves = []
     for sid in sorted(run["steps"], key=lambda s: index.get(s, 0)):
         step = run["steps"][sid]
-        if step["status"] != STEP_PENDING:
+        if step["status"] != STEP_PENDING or step.get("kind") == KIND_APPROVAL:
             continue
-        if all(run["steps"][d]["status"] == STEP_SUCCEEDED for d in step["depends_on"]):
+        if _deps_succeeded(run, step):
             step["status"], step["ready_at"] = STEP_READY, now_iso
+            moves.append(sid)
+    return moves
+
+
+def _refresh_waiting(run, now_iso):
+    """Park pending approval steps whose dependencies all succeeded.
+
+    An approval never becomes ``ready`` and therefore never gets claimed; it
+    waits for an HTTP decision instead.
+    """
+    index = run["order_index"]
+    moves = []
+    for sid in sorted(run["steps"], key=lambda s: index.get(s, 0)):
+        step = run["steps"][sid]
+        if step["status"] != STEP_PENDING or step.get("kind") != KIND_APPROVAL:
+            continue
+        if _deps_succeeded(run, step):
+            step["status"], step["ready_at"] = STEP_WAITING, now_iso
             moves.append(sid)
     return moves
 
@@ -57,6 +92,10 @@ def _derive_run_status(run):
     if steps and all(s["status"] == STEP_SUCCEEDED for s in steps):
         return RUN_SUCCEEDED
     if any(s["status"] in (STEP_RUNNING, STEP_SUCCEEDED) for s in steps):
+        return RUN_RUNNING
+    # A waiting approval has work outstanding but no lease yet, so the run is
+    # already in motion even though nothing has been claimed.
+    if any(s["status"] == STEP_WAITING for s in steps):
         return RUN_RUNNING
     return RUN_PENDING
 
@@ -97,7 +136,13 @@ class Scheduler:
             self._event(run, run_id, None, "run_created")
             for sid in _refresh_ready(run, self._iso()):
                 self._event(run, run_id, sid, "ready", attempt=0)
-            run["status"], run["updated_at"] = _derive_run_status(run), self._iso()
+            for sid in _refresh_waiting(run, self._iso()):
+                self._event(run, run_id, sid, "waiting", attempt=0)
+            previous = run["status"]
+            run["status"] = _derive_run_status(run)
+            if run["status"] == RUN_RUNNING and previous == RUN_PENDING:
+                self._event(run, run_id, None, "run_started")
+            run["updated_at"] = self._iso()
             return self.store.save_run(run)
 
     def get_run(self, tenant, run_id):
@@ -146,6 +191,8 @@ class Scheduler:
             self._expire_leases(run, now)
             for sid in _refresh_ready(run, self._iso()):
                 self._event(run, run_id, sid, "ready", attempt=run["steps"][sid]["attempt"])
+            for sid in _refresh_waiting(run, self._iso()):
+                self._event(run, run_id, sid, "waiting", attempt=run["steps"][sid]["attempt"])
             candidates = [s for s in run["steps"].values() if s["status"] == STEP_READY]
             index = run["order_index"]
             step = min(candidates, key=lambda s: (index.get(s["id"], 0), s["id"])) if candidates else None
@@ -178,6 +225,10 @@ class Scheduler:
             step = run["steps"].get(step_id)
             if step is None:
                 raise WorkflowError("unknown step: %s" % step_id, "unknown_step")
+            if step.get("kind") == KIND_APPROVAL:
+                raise ConflictError(
+                    "step %s is an approval step; decide it over the decision API" % step_id,
+                    "not_a_task")
             if step["status"] == STEP_SUCCEEDED and step["worker_id"] == worker_id:
                 return run
             step = self._require_lease(run, step_id, worker_id)
@@ -189,6 +240,8 @@ class Scheduler:
                         worker_id=worker_id, result=result)
             for sid in _refresh_ready(run, self._iso()):
                 self._event(run, run_id, sid, "ready", attempt=run["steps"][sid]["attempt"])
+            for sid in _refresh_waiting(run, self._iso()):
+                self._event(run, run_id, sid, "waiting", attempt=run["steps"][sid]["attempt"])
             run["status"] = _derive_run_status(run)
             if run["status"] == RUN_SUCCEEDED:
                 self._event(run, run_id, None, "run_succeeded")
@@ -201,6 +254,13 @@ class Scheduler:
         now = self.now()
         with self.store.locked():
             run = self.get_run(tenant, run_id)
+            step = run["steps"].get(step_id)
+            if step is None:
+                raise WorkflowError("unknown step: %s" % step_id, "unknown_step")
+            if step.get("kind") == KIND_APPROVAL:
+                raise ConflictError(
+                    "step %s is an approval step; decide it over the decision API" % step_id,
+                    "not_a_task")
             step = self._require_lease(run, step_id, worker_id)
             step.update(attempt=step["attempt"] + 1, worker_id=None, lease_deadline=None, error=error)
             self._event(run, run_id, step_id, "fail", attempt=step["attempt"], worker_id=worker_id,
@@ -217,6 +277,59 @@ class Scheduler:
                             worker_id=worker_id)
             run["status"] = _derive_run_status(run)
             if run["status"] == RUN_FAILED:
+                self._event(run, run_id, None, "run_failed")
+            run["updated_at"] = self._iso()
+            self.store.save_run(run)
+            return run
+
+    # -- approval decisions --------------------------------------------
+    def decide(self, tenant, run_id, step_id, actor, decision):
+        """Apply the first ``approve``/``reject`` decision to a waiting step.
+
+        Repeating the very same decision (same actor, same outcome) is a
+        no-op and returns the unchanged run; any other repeat is a conflict.
+        """
+        if not isinstance(actor, str) or not actor.strip():
+            raise WorkflowError("actor must be a non-empty string", "bad_actor")
+        if decision not in DECISIONS:
+            raise WorkflowError("decision must be one of: %s" % ", ".join(DECISIONS),
+                                "bad_decision")
+        with self.store.locked():
+            actor = actor.strip()
+            run = self.get_run(tenant, run_id)
+            step = run["steps"].get(step_id)
+            if step is None:
+                raise WorkflowError("unknown step: %s" % step_id, "unknown_step")
+            if step.get("kind") != KIND_APPROVAL:
+                raise ConflictError(
+                    "step %s is not an approval step" % step_id, "not_an_approval")
+            recorded = step.get("approval")
+            if recorded is not None:
+                if recorded["actor"] == actor and recorded["decision"] == decision:
+                    return run
+                raise ConflictError(
+                    "step %s already has a decision by %s" % (step_id, recorded["actor"]),
+                    "decision_conflict")
+            if step["status"] != STEP_WAITING:
+                raise ConflictError(
+                    "step %s is not waiting for a decision" % step_id, "not_waiting")
+            at = self._iso()
+            step.update(status=(STEP_SUCCEEDED if decision == DECISION_APPROVE else STEP_FAILED),
+                        approval={"actor": actor, "decision": decision, "at": at},
+                        finished_at=at)
+            self._event(run, run_id, step_id, "decision", attempt=0, worker_id=None,
+                        actor=actor, decision=decision, at=at)
+            if decision == DECISION_APPROVE:
+                for sid in _refresh_ready(run, self._iso()):
+                    self._event(run, run_id, sid, "ready",
+                                attempt=run["steps"][sid]["attempt"])
+                for sid in _refresh_waiting(run, self._iso()):
+                    self._event(run, run_id, sid, "waiting",
+                                attempt=run["steps"][sid]["attempt"])
+            run["status"] = _derive_run_status(run)
+            if run["status"] == RUN_SUCCEEDED:
+                self._event(run, run_id, None, "run_succeeded")
+            elif run["status"] == RUN_FAILED:
                 self._event(run, run_id, None, "run_failed")
             run["updated_at"] = self._iso()
             self.store.save_run(run)
@@ -246,6 +359,8 @@ class Scheduler:
                 continue
             if etype == "ready":
                 step.update(status=STEP_READY, ready_at=at)
+            elif etype == "waiting":
+                step.update(status=STEP_WAITING, ready_at=at)
             elif etype == "claim":
                 step.update(status=STEP_RUNNING, worker_id=event.get("worker_id"), started_at=at)
             elif etype == "takeover":
@@ -254,6 +369,11 @@ class Scheduler:
                 step.update(status=STEP_SUCCEEDED, result=event.get("result"), finished_at=at,
                             lease_deadline=None, worker_id=None,
                             attempt=step["attempt"] if attempt is None else attempt)
+            elif etype == "decision":
+                decision = event.get("decision")
+                step.update(status=(STEP_SUCCEEDED if decision == DECISION_APPROVE else STEP_FAILED),
+                            approval={"actor": event.get("actor"), "decision": decision, "at": at},
+                            finished_at=at, lease_deadline=None, worker_id=None, attempt=0)
             elif etype == "fail":
                 step.update(error=event.get("error"),
                             attempt=step["attempt"] if attempt is None else attempt)

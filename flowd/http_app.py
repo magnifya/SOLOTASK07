@@ -6,11 +6,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 from .model import WorkflowError
-from .scheduler import LeaseError
+from .scheduler import DECISIONS, ConflictError, LeaseError
 
 MAX_BODY = 1 << 20
 STATUS_FOR_CODE = {"unknown_run": 404, "unknown_workflow": 404, "unknown_step": 404,
-                   "cross_tenant": 403}
+                   "cross_tenant": 403, "conflict": 409, "not_a_task": 409,
+                   "not_an_approval": 409, "not_waiting": 409,
+                   "decision_conflict": 409}
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -96,6 +98,9 @@ class _Handler(BaseHTTPRequestHandler):
             action = re.fullmatch(r"/v1/runs/([^/]+)/(claim|complete|fail)", path)
             if action:
                 return self._step_action(action.group(1), action.group(2), self._body())
+            decision = re.fullmatch(r"/v1/runs/([^/]+)/decision", path)
+            if decision:
+                return self._decision(decision.group(1), self._body())
         solo = re.fullmatch(r"/v1/runs/([^/]+)", path)
         if method == "GET" and solo:
             return self._get_run(query, solo.group(1))
@@ -133,13 +138,39 @@ class _Handler(BaseHTTPRequestHandler):
                                       body.get("error"))
         return self._json(200, _run_view(run))
 
+    def _decision(self, run_id, body):
+        tenant = _require_nonempty_string(body, "tenant")
+        step_id = _require_nonempty_string(body, "step_id")
+        actor = _require_nonempty_string(body, "actor")
+        decision = body.get("decision")
+        if not isinstance(decision, str) or decision not in DECISIONS:
+            raise WorkflowError(
+                "decision must be one of: %s" % ", ".join(DECISIONS), "bad_decision")
+        owner = self.scheduler.store.run_exists(run_id)
+        if owner is not None and owner != tenant:
+            raise WorkflowError("run %s belongs to another tenant" % run_id, "cross_tenant")
+        run = self.scheduler.decide(tenant, run_id, step_id, actor, decision)
+        return self._json(200, _run_view(run))
+
+
+def _require_nonempty_string(body, field):
+    """Validate a present, string-typed, whitespace-trimmed-nonempty field."""
+    value = body.get(field)
+    if not isinstance(value, str) or not value.strip():
+        raise WorkflowError("%s must be a non-empty string" % field, "bad_%s" % field)
+    return value.strip()
+
 
 def _step_view(step):
-    return {"id": step["id"], "status": step["status"], "attempt": step["attempt"],
+    view = {"id": step["id"], "status": step["status"], "attempt": step["attempt"],
             "max_attempts": step["max_attempts"], "depends_on": list(step["depends_on"]),
             "worker_id": step["worker_id"], "lease_deadline": step["lease_deadline"],
             "next_attempt_at": step["next_attempt_at"], "result": step.get("result"),
             "error": step.get("error")}
+    if step.get("kind", "task") == "approval":
+        view["kind"] = "approval"
+        view["approval"] = step.get("approval")
+    return view
 
 
 def _run_view(run):

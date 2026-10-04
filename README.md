@@ -2,9 +2,10 @@
 
 A minimal but real **distributed task scheduling / workflow orchestration backend**:
 DAG definition and validation, run state machine, worker leases with expiry and
-takeover, retries with exponential backoff, idempotent completion, append-only
-history with replay, multi-tenant isolation, and a small JSON HTTP API. Standard
-library only: no pip installs, no network access, no third-party imports.
+takeover, retries with exponential backoff, idempotent completion, human
+**approval gates** (`"kind": "approval"`), append-only history with replay,
+multi-tenant isolation, and a small JSON HTTP API. Standard library only: no pip
+installs, no network access, no third-party imports.
 
 Data lives in a single directory: `<root>/<tenant>/workflows.json` plus
 `<root>/<tenant>/runs/<run_id>.json`, written atomically, so restarting the
@@ -35,7 +36,42 @@ python3 -m flowd --data-dir ./flowd_data list --tenant acme
 ```
 
 `steps.json` is a JSON list of steps, e.g.
-`[{"id": "step1", "depends_on": []}, {"id": "step2", "depends_on": ["step1"], "max_attempts": 3}]`.
+`[{"id": "step1", "depends_on": []}, {"id": "step2", "depends_on": ["step1"], "max_attempts": 3},
+{"id": "signoff", "depends_on": ["step1"], "kind": "approval"}]`.
+`kind` is optional (`task` by default) and must be `task` or `approval`.
+
+## Approval gates
+
+An `approval` step never enters `ready` and can never be claimed. Once all its
+dependencies have `succeeded` (or immediately, when it has none) it moves to
+`waiting`; the run then counts as `running` even though no lease is held.
+Approval steps hold no lease, never retry, and always report `attempt: 0`;
+`worker_id`, `lease_deadline`, `next_attempt_at`, `result` and `error` stay
+`null`. Other independent task steps keep being claimed in the usual order.
+
+A gate is resolved with
+`POST /v1/runs/{run_id}/decision`, body
+`{"tenant", "step_id", "actor", "decision"}`, where `decision` is `approve` or
+`reject` and the three string fields must be non-empty after trimming
+whitespace (400 otherwise, bad JSON included):
+
+- `approve` -> the step `succeeded` and dependent task steps unlock; dependent
+  approval gates start waiting.
+- `reject` -> the step and the whole run `failed`; dependent steps stay
+  `pending`.
+- Repeating the same actor + decision returns 200 and keeps the first record
+  and timestamp (no new history). A different actor, the opposite decision, a
+  decision before the gate is waiting, or targeting a task step returns 409.
+- Unknown run/step -> 404, another tenant -> 403. Conflicts are serialized by
+  the store lock, so concurrent identical requests follow the same rules.
+
+Run views add `kind: "approval"` and `approval` to waiting/decided steps only
+(`null` before the first decision, then `{"actor", "decision", "at"}` in the
+existing UTC format); task steps look exactly as before. Entering `waiting` and
+the first decision each append one history event; the decision event carries
+the usual `at/run_id/step_id/attempt/worker_id` fields plus `actor` and
+`decision`. The state survives restarts and `replay`; old run documents without
+`kind` are treated as tasks.
 
 ## HTTP API
 
@@ -48,13 +84,14 @@ python3 -m flowd --data-dir ./flowd_data list --tenant acme
 | POST | `/v1/runs/{run_id}/claim` | 200 `{"step":...}`, 204 nothing ready | 400 bad request, 403 cross-tenant, 404 unknown run |
 | POST | `/v1/runs/{run_id}/complete` | 200 updated run | 400 bad request, 403, 404 unknown step, 409 lease not held/expired |
 | POST | `/v1/runs/{run_id}/fail` | 200 updated run | 400 bad request, 403, 404 unknown step, 409 lease not held/expired |
+| POST | `/v1/runs/{run_id}/decision` | 200 updated run | 400 bad request/JSON, 403 cross-tenant, 404 unknown run/step, 409 conflict/not waiting/not an approval |
 | GET | `/v1/runs?tenant=&status=&limit=&after=` | 200 `{"items":[...],"next_after":...}` | 400 missing tenant |
 
 Errors are always `{"error": "<message>"}`.
 
 ## Step / run state machine
 
-Step states: `pending` -> `ready` -> `running` -> `succeeded` | `failed`.
+Task step states: `pending` -> `ready` -> `running` -> `succeeded` | `failed`.
 
 - A step starts `pending` and becomes `ready` only when **all** dependencies are `succeeded`.
 - `claim` (worker lease) moves a `ready` step to `running` and sets `lease_deadline`.
@@ -66,9 +103,17 @@ Step states: `pending` -> `ready` -> `running` -> `succeeded` | `failed`.
 - Claim order is deterministic: `(topological index, step id)`, at most one active
   lease per step.
 
+Approval step states: `pending` -> `waiting` -> `succeeded` | `failed`.
+
+- Becomes `waiting` once all dependencies succeed (immediately with none), then
+  waits for an HTTP `approve`/`reject` decision; it is never `ready`/`running`,
+  is skipped by `claim`, and `complete`/`fail` on it return 409.
+- `waiting` only blocks its own successors; independent task steps are unaffected.
+
 Run states: `pending` -> `running` -> `succeeded` | `failed`.
 
-- `pending` until a step is first claimed; `running` while work is outstanding.
+- `pending` until a step is first claimed (or an approval gate starts waiting);
+  `running` while work is outstanding.
 - `succeeded` when every step is `succeeded`.
 - `failed` as soon as any step exhausts `max_attempts` (default 3).
 

@@ -27,8 +27,12 @@ RUN_FAILED = "failed"
 STEP_PENDING = "pending"
 STEP_READY = "ready"
 STEP_RUNNING = "running"
+STEP_WAITING = "waiting"
 STEP_SUCCEEDED = "succeeded"
 STEP_FAILED = "failed"
+
+KIND_TASK = "task"
+KIND_APPROVAL = "approval"
 
 TERMINAL_RUN_STATES = (RUN_SUCCEEDED, RUN_FAILED)
 
@@ -116,6 +120,7 @@ class WorkflowStore:
         run = read_json(self.run_path(tenant, run_id), None)
         if run is None:
             raise WorkflowError("unknown run: %s" % run_id, "unknown_run")
+        _upgrade_run(run)
         return run
 
     def run_exists(self, run_id):
@@ -131,6 +136,7 @@ class WorkflowStore:
         for name in sorted(os.listdir(runs_dir)) if os.path.isdir(runs_dir) else []:
             run = read_json(os.path.join(runs_dir, name), None) if name.endswith(".json") else None
             if run is not None:
+                _upgrade_run(run)
                 items.append(run)
         items.sort(key=lambda r: (r.get("created_at", ""), r.get("run_id", "")))
         if status:
@@ -143,6 +149,13 @@ class WorkflowStore:
         return page, (page[-1]["run_id"] if len(items) > limit else None)
 
 
+def _upgrade_run(run):
+    """Backfill approval-era fields on run documents written by older versions."""
+    for step in (run.get("steps") or {}).values():
+        step.setdefault("kind", KIND_TASK)
+        step.setdefault("approval", None)
+
+
 def new_run(tenant, workflow_id, run_id, params, plan, now_iso):
     """Build a fresh run document from a validated plan."""
     steps = {
@@ -150,6 +163,8 @@ def new_run(tenant, workflow_id, run_id, params, plan, now_iso):
             "id": step["id"],
             "depends_on": list(step["depends_on"]),
             "max_attempts": step["max_attempts"],
+            # plans written before approvals existed carry no kind: treat as tasks
+            "kind": step.get("kind", KIND_TASK),
             "status": STEP_PENDING,
             "attempt": 0,
             "worker_id": None,
@@ -160,6 +175,8 @@ def new_run(tenant, workflow_id, run_id, params, plan, now_iso):
             "finished_at": None,
             "result": None,
             "error": None,
+            # approval-only: null until the first approve/reject lands
+            "approval": None,
         }
         for step in plan["steps"]
     }

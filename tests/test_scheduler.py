@@ -6,13 +6,21 @@ import tempfile
 import unittest
 
 from flowd.model import WorkflowError
-from flowd.scheduler import LeaseError, Scheduler, backoff_seconds
+from flowd.scheduler import ConflictError, LeaseError, Scheduler, backoff_seconds
 from flowd.store import WorkflowStore
 
 LINEAR = [
     {"id": "step1", "depends_on": []},
     {"id": "step2", "depends_on": ["step1"]},
     {"id": "step3", "depends_on": ["step2"]},
+]
+
+# a -- approve -- b, plus an independent task c
+APPROVAL_PLAN = [
+    {"id": "a", "depends_on": []},
+    {"id": "g", "depends_on": ["a"], "kind": "approval"},
+    {"id": "b", "depends_on": ["g"]},
+    {"id": "c", "depends_on": []},
 ]
 
 
@@ -293,6 +301,187 @@ class PersistenceTest(SchedulerTestBase):
         )
         self.assertEqual([n for _, _, files in os.walk(self.root) for n in files
                           if n.endswith(".tmp")], [])
+
+
+class ApprovalTest(SchedulerTestBase):
+    def approval_workflow(self, workflow_id="signoff", steps=None):
+        return self.scheduler.submit("acme", workflow_id, steps or APPROVAL_PLAN)
+
+    def decide(self, run_id, step_id, actor="alice", decision="approve", tenant="acme"):
+        return self.scheduler.decide(tenant, run_id, step_id, actor, decision)
+
+    def finish_a(self, run_id, worker="w1"):
+        """Claim and complete prerequisite task ``a`` so gate ``g`` can wait."""
+        self.claim(run_id, worker)
+        return self.complete(run_id, "a", worker)
+
+    def test_approval_without_dependencies_waits_at_creation(self):
+        self.scheduler.submit("acme", "lone", [{"id": "g", "depends_on": [], "kind": "approval"}])
+        run = self.scheduler.start_run("acme", "lone")
+        gate = run["steps"]["g"]
+        self.assertEqual(gate["status"], "waiting")
+        self.assertEqual(run["status"], "running")  # waiting counts as work outstanding
+        self.assertEqual(gate["attempt"], 0)
+        self.assertIsNone(gate["worker_id"])
+        self.assertIsNone(gate["lease_deadline"])
+        self.assertIsNone(gate["result"])
+        self.assertIsNone(gate["error"])
+        self.assertIsNone(gate["approval"])
+        events = [e for e in run["history"] if e["step_id"] == "g"]
+        self.assertEqual([e["type"] for e in events], ["waiting"])
+
+    def test_approval_waits_only_after_dependencies_succeed(self):
+        self.approval_workflow()
+        run = self.scheduler.start_run("acme", "signoff")
+        status = {sid: s["status"] for sid, s in run["steps"].items()}
+        self.assertEqual(status, {"a": "ready", "c": "ready", "g": "pending", "b": "pending"})
+        self.assertEqual(self.claim(run["run_id"])["id"], "a")
+        self.assertEqual(self.claim(run["run_id"], "w2")["id"], "c")
+        self.assertIsNone(self.claim(run["run_id"]))  # gate not claimable
+        run = self.complete(run["run_id"], "a")
+        self.assertEqual(run["steps"]["g"]["status"], "waiting")
+        self.assertEqual(run["steps"]["b"]["status"], "pending")
+
+    def test_approve_succeeds_gate_and_unlocks_successors(self):
+        self.approval_workflow()
+        run = self.scheduler.start_run("acme", "signoff")
+        run = self.finish_a(run["run_id"])
+        before = run["steps"]["g"]["ready_at"]
+        run = self.decide(run["run_id"], "g", actor="alice", decision="approve")
+        gate = run["steps"]["g"]
+        self.assertEqual(gate["status"], "succeeded")
+        self.assertEqual(gate["attempt"], 0)
+        self.assertEqual(gate["approval"],
+                         {"actor": "alice", "decision": "approve", "at": gate["finished_at"]})
+        self.assertEqual(gate["ready_at"], before)
+        self.assertEqual(run["steps"]["b"]["status"], "ready")
+        decision_events = [e for e in run["history"] if e["type"] == "decision"]
+        self.assertEqual(len(decision_events), 1)
+        event = decision_events[0]
+        self.assertEqual(event["step_id"], "g")
+        self.assertEqual(event["attempt"], 0)
+        self.assertEqual(event["actor"], "alice")
+        self.assertEqual(event["decision"], "approve")
+        self.assertIn("at", event)
+
+    def test_reject_fails_gate_and_run_while_successors_stay_pending(self):
+        self.approval_workflow()
+        run = self.scheduler.start_run("acme", "signoff")
+        self.finish_a(run["run_id"])
+        run = self.decide(run["run_id"], "g", actor="bob", decision="reject")
+        self.assertEqual(run["steps"]["g"]["status"], "failed")
+        self.assertEqual(run["steps"]["b"]["status"], "pending")
+        self.assertEqual(run["status"], "failed")
+        self.assertEqual(run["steps"]["g"]["approval"]["decision"], "reject")
+        self.assertEqual(run["history"][-1]["type"], "run_failed")
+        # the failed gate never turns into a task; only the independent task is claimable
+        self.assertEqual(self.claim(run["run_id"], "w2")["id"], "c")
+        self.assertIsNone(self.claim(run["run_id"], "w3"))
+
+    def test_claim_complete_fail_skip_or_reject_approval(self):
+        self.scheduler.submit("acme", "lone", [{"id": "g", "depends_on": [], "kind": "approval"}])
+        run = self.scheduler.start_run("acme", "lone")
+        self.assertIsNone(self.claim(run["run_id"]))
+        with self.assertRaises(ConflictError) as ctx:
+            self.complete(run["run_id"], "g")
+        self.assertEqual(ctx.exception.code, "not_a_task")
+        with self.assertRaises(ConflictError) as ctx:
+            self.scheduler.fail("acme", run["run_id"], "g", "w1", "boom")
+        self.assertEqual(ctx.exception.code, "not_a_task")
+
+    def test_same_decision_is_idempotent_but_other_repeats_conflict(self):
+        self.scheduler.submit("acme", "lone", [{"id": "g", "depends_on": [], "kind": "approval"}])
+        run = self.scheduler.start_run("acme", "lone")
+        first = self.decide(run["run_id"], "g", "alice", "approve")
+        length = len(first["history"])
+        at = first["steps"]["g"]["approval"]["at"]
+
+        repeat = self.decide(run["run_id"], "g", " alice ", "approve")  # trimmed actor
+        self.assertEqual(repeat["steps"]["g"]["approval"], {"actor": "alice", "decision": "approve",
+                                                           "at": at})
+        self.assertEqual(len(repeat["history"]), length)
+
+        with self.assertRaises(ConflictError) as ctx:
+            self.decide(run["run_id"], "g", "carol", "approve")
+        self.assertEqual(ctx.exception.code, "decision_conflict")
+        with self.assertRaises(ConflictError) as ctx:
+            self.decide(run["run_id"], "g", "alice", "reject")
+        self.assertEqual(ctx.exception.code, "decision_conflict")
+        # failed conflicts leave the first record intact
+        self.assertEqual(self.scheduler.get_run("acme", run["run_id"])["steps"]["g"]["approval"],
+                         {"actor": "alice", "decision": "approve", "at": at})
+
+    def test_decide_before_waiting_or_on_a_task_conflicts(self):
+        self.approval_workflow()
+        run = self.scheduler.start_run("acme", "signoff")
+        with self.assertRaises(ConflictError) as ctx:
+            self.decide(run["run_id"], "g")  # still pending
+        self.assertEqual(ctx.exception.code, "not_waiting")
+        with self.assertRaises(ConflictError) as ctx:
+            self.decide(run["run_id"], "a")  # ordinary task
+        self.assertEqual(ctx.exception.code, "not_an_approval")
+        with self.assertRaises(WorkflowError) as ctx:
+            self.decide(run["run_id"], "ghost")
+        self.assertEqual(ctx.exception.code, "unknown_step")
+
+    def test_decide_unknown_and_cross_tenant_raise_unknown_run(self):
+        self.scheduler.submit("globex", "lone", [{"id": "g", "depends_on": [], "kind": "approval"}])
+        gx = self.scheduler.start_run("globex", "lone")
+        with self.assertRaises(WorkflowError) as ctx:
+            self.decide("missing", "g", tenant="acme")
+        self.assertEqual(ctx.exception.code, "unknown_run")
+        # the scheduler can only see a run inside its own tenant dir, so this is 404 too;
+        # the HTTP layer turns it into 403 via run_exists
+        with self.assertRaises(WorkflowError) as ctx:
+            self.decide(gx["run_id"], "g", tenant="acme")
+        self.assertEqual(ctx.exception.code, "unknown_run")
+
+    def test_replay_preserves_waiting_decisions_and_attempts(self):
+        self.approval_workflow()
+        run = self.scheduler.start_run("acme", "signoff")
+        self.finish_a(run["run_id"])
+        stored = self.decide(run["run_id"], "g", "alice", "approve")
+        replayed = self.scheduler.replay("acme", run["run_id"])
+        for sid in run["step_order"]:
+            self.assertEqual(replayed["steps"][sid]["status"], stored["steps"][sid]["status"], sid)
+            self.assertEqual(replayed["steps"][sid]["attempt"], stored["steps"][sid]["attempt"], sid)
+        self.assertEqual(replayed["steps"]["g"]["approval"], stored["steps"]["g"]["approval"])
+        self.assertEqual(replayed["status"], stored["status"])
+
+        # a still-waiting gate replays to waiting with attempt 0
+        self.scheduler.submit("acme", "lone", [{"id": "g", "depends_on": [], "kind": "approval"}])
+        lone = self.scheduler.start_run("acme", "lone")
+        rebuilt = self.scheduler.replay("acme", lone["run_id"])
+        self.assertEqual(rebuilt["steps"]["g"]["status"], "waiting")
+        self.assertEqual(rebuilt["steps"]["g"]["attempt"], 0)
+        self.assertIsNone(rebuilt["steps"]["g"]["approval"])
+
+    def test_approval_state_survives_restart(self):
+        self.approval_workflow()
+        run = self.scheduler.start_run("acme", "signoff")
+        self.finish_a(run["run_id"])
+        self.decide(run["run_id"], "g", "alice", "approve")
+
+        restarted = Scheduler(WorkflowStore(self.root, clock=self.clock), clock=self.clock)
+        again = restarted.get_run("acme", run["run_id"])
+        self.assertEqual(again["steps"]["g"]["status"], "succeeded")
+        self.assertEqual(again["steps"]["g"]["attempt"], 0)
+        self.assertEqual(again["steps"]["g"]["approval"]["actor"], "alice")
+        self.assertEqual(restarted.replay("acme", run["run_id"])["steps"]["g"]["approval"],
+                         again["steps"]["g"]["approval"])
+
+    def test_old_run_documents_without_kind_are_treated_as_tasks(self):
+        self.workflow()
+        run = self.scheduler.start_run("acme", "etl")
+        # simulate a document written by the pre-approval version
+        for step in run["steps"].values():
+            del step["kind"]
+            del step["approval"]
+        self.store.save_run(run)
+        reloaded = self.scheduler.get_run("acme", run["run_id"])
+        self.assertEqual(reloaded["steps"]["step1"]["kind"], "task")
+        self.assertIsNone(reloaded["steps"]["step1"]["approval"])
+        self.assertEqual(self.claim(run["run_id"])["id"], "step1")
 
 
 if __name__ == "__main__":
