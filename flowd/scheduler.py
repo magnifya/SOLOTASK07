@@ -59,6 +59,58 @@ def normalize_max_parallelism(value):
     return int(value)
 
 
+def normalize_idempotency_key(value):
+    """Validate an optional idempotency key.
+
+    ``None`` means idempotency is disabled and the call keeps its legacy
+    behavior.  Otherwise the value must be a string that is non-empty after
+    trimming; the trimmed key is what gets stored and matched.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise WorkflowError("idempotency_key must be a string", "bad_idempotency_key")
+    key = value.strip()
+    if not key:
+        raise WorkflowError("idempotency_key must be a non-empty string", "bad_idempotency_key")
+    return key
+
+
+def normalize_params(value):
+    """Validate ``params`` on a keyed create: object only, null/omit = ``{}``."""
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise WorkflowError("params must be a JSON object", "bad_params")
+    return value
+
+
+def params_equal(left, right):
+    """Semantic JSON equality for run params.
+
+    Object key order is ignored, array order is preserved, booleans are not
+    numbers (``True != 1``), and numeric ints/floats compare by numeric value
+    (``1 == 1.0``).
+    """
+    if isinstance(left, bool) or isinstance(right, bool):
+        return isinstance(left, bool) and isinstance(right, bool) and left == right
+    if isinstance(left, dict) or isinstance(right, dict):
+        if not (isinstance(left, dict) and isinstance(right, dict)):
+            return False
+        if left.keys() != right.keys():
+            return False
+        return all(params_equal(left[name], right[name]) for name in left)
+    if isinstance(left, list) or isinstance(right, list):
+        if not (isinstance(left, list) and isinstance(right, list)):
+            return False
+        return len(left) == len(right) and all(
+            params_equal(a, b) for a, b in zip(left, right)
+        )
+    if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+        return left == right
+    return left == right
+
+
 def _active_lease_count(run, now):
     """Count ordinary tasks in this run holding a strictly unexpired lease.
 
@@ -136,23 +188,72 @@ class Scheduler:
     def submit(self, tenant, workflow_id, steps):
         return self.store.save_workflow(tenant, workflow_id, steps)
 
-    def start_run(self, tenant, workflow_id, run_id=None, params=None, max_parallelism=None):
+    def start_run(self, tenant, workflow_id, run_id=None, params=None, max_parallelism=None,
+                  idempotency_key=None):
+        key = normalize_idempotency_key(idempotency_key)
         max_parallelism = normalize_max_parallelism(max_parallelism)
-        plan = self.store.get_workflow(tenant, workflow_id)
+        if key is not None:
+            params = normalize_params(params)
         with self.store.locked():
+            if key is not None:
+                return self._start_idempotent_run(
+                    tenant, workflow_id, run_id, params, max_parallelism, key
+                )
+            plan = self.store.get_workflow(tenant, workflow_id)
             run_id = run_id or self.store.generate_run_id()
             if self.store.run_exists(run_id) == tenant:
                 raise WorkflowError("run already exists: %s" % run_id, "duplicate_run")
             run = new_run(tenant, workflow_id, run_id, params, plan, self._iso(),
                           max_parallelism=max_parallelism)
-            self._event(run, run_id, None, "run_created")
-            ready, waiting = _promote_pending(run, self._iso())
-            for sid in ready:
-                self._event(run, run_id, sid, "ready", attempt=0)
-            for sid in waiting:
-                self._event(run, run_id, sid, "waiting", attempt=0)
-            run["status"], run["updated_at"] = _derive_run_status(run), self._iso()
-            return self.store.save_run(run)
+            return self._create_run(run, plan)
+
+    def _start_idempotent_run(self, tenant, workflow_id, run_id, params, max_parallelism, key):
+        """Create once per (tenant, trimmed key); replay identical requests.
+
+        Runs inside the store lock so concurrent identical requests share one
+        run while differing requests conflict against the first creation.
+        """
+        index = self.store.load_idempotency(tenant)
+        record = index.get(key)
+        if record is not None:
+            existing = self.get_run(tenant, record["run_id"])
+            if run_id is not None and run_id != existing["run_id"]:
+                raise ConflictError(
+                    "idempotency_key %s is already bound to run %s"
+                    % (key, existing["run_id"]),
+                    "idempotency_conflict",
+                )
+            if existing["workflow_id"] != workflow_id \
+                    or not params_equal(existing.get("params") or {}, params) \
+                    or existing.get("max_parallelism") != max_parallelism:
+                raise ConflictError(
+                    "request differs from the run first created with idempotency_key %s" % key,
+                    "idempotency_conflict",
+                )
+            # A repeat changes nothing: no history, no updated_at, no lease.
+            return existing
+        plan = self.store.get_workflow(tenant, workflow_id)
+        run_id = run_id or self.store.generate_run_id()
+        if self.store.run_exists(run_id) == tenant:
+            raise WorkflowError("run already exists: %s" % run_id, "duplicate_run")
+        run = new_run(tenant, workflow_id, run_id, params, plan, self._iso(),
+                      max_parallelism=max_parallelism, idempotency_key=key)
+        self._create_run(run, plan)
+        index[key] = {"run_id": run_id}
+        self.store.save_idempotency(tenant, index)
+        return run
+
+    def _create_run(self, run, plan):
+        """Append creation events and persist a freshly built run."""
+        run_id = run["run_id"]
+        self._event(run, run_id, None, "run_created")
+        ready, waiting = _promote_pending(run, self._iso())
+        for sid in ready:
+            self._event(run, run_id, sid, "ready", attempt=0)
+        for sid in waiting:
+            self._event(run, run_id, sid, "waiting", attempt=0)
+        run["status"], run["updated_at"] = _derive_run_status(run), self._iso()
+        return self.store.save_run(run)
 
     def get_run(self, tenant, run_id):
         run = self.store.load_run(tenant, run_id)
@@ -410,7 +511,8 @@ class Scheduler:
         plan = self.store.get_workflow(tenant, stored["workflow_id"])
         rebuilt = new_run(tenant, stored["workflow_id"], run_id, stored.get("params"), plan,
                           stored["created_at"],
-                          max_parallelism=stored.get("max_parallelism"))
+                          max_parallelism=stored.get("max_parallelism"),
+                          idempotency_key=stored.get("idempotency_key"))
         steps = rebuilt["steps"]
         for event in stored["history"]:
             sid, etype, at = event.get("step_id"), event.get("type"), event.get("at")

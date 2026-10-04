@@ -94,7 +94,8 @@ class _Handler(BaseHTTPRequestHandler):
                 body = self._body()
                 run = self.scheduler.start_run(self._tenant({}, body), body.get("workflow_id"),
                                                body.get("run_id"), body.get("params"),
-                                               body.get("max_parallelism"))
+                                               body.get("max_parallelism"),
+                                               body.get("idempotency_key"))
                 return self._json(201, _run_view(run))
             action = re.fullmatch(r"/v1/runs/([^/]+)/(claim|complete|fail|decision|heartbeat)", path)
             if action:
@@ -183,6 +184,7 @@ def _run_view(run):
     return {"tenant": run["tenant"], "run_id": run["run_id"], "workflow_id": run["workflow_id"],
             "status": run["status"], "params": run.get("params") or {},
             "max_parallelism": run.get("max_parallelism"),
+            "idempotency_key": run.get("idempotency_key"),
             "created_at": run.get("created_at"), "updated_at": run.get("updated_at"),
             "steps": [_step_view(run["steps"][sid]) for sid in run["step_order"]],
             "history_length": len(run.get("history") or [])}
