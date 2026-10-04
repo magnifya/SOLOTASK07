@@ -105,6 +105,27 @@ approval steps instead go `pending` -> `waiting` -> `succeeded` | `failed`.
 - Claim order is deterministic: `(topological index, step id)`, at most one active
   lease per step.
 
+### Per-run parallelism quota
+
+`POST /v1/runs` and `Scheduler.start_run` accept an optional `max_parallelism`:
+the maximum number of live task leases the run may hold at once. Omitted or
+`null` means unlimited; any other value must be an integer greater than zero
+(booleans, floats, strings and non-positive integers are rejected with
+`WorkflowError` / 400 and no run is created). The value is fixed at creation,
+is shown by run creation, run detail, the run list and CLI `status`, and runs
+written before this field existed read as `null`.
+
+Only ordinary tasks that are `running` with a `lease_deadline` strictly in the
+future occupy a slot — each leased task counts one, however many a single
+worker holds; approval nodes and steps awaiting retry, succeeded or failed
+never count. Expired leases (deadline `<=` now) are reclaimed via the usual
+`takeover` rule before slots are counted. When the quota is full, `claim`
+returns nothing (HTTP 204, CLI `"step": null`): ready steps stay ready, no
+claim history is appended, and any takeovers from that call are still
+recorded. Completing or failing a task frees its slot. The quota is per run —
+other runs and other tenants never share it — and `heartbeat` only extends a
+lease, never takes or frees a slot.
+
 Run states: `pending` -> `running` -> `succeeded` | `failed`.
 
 - `pending` until a step is first claimed; `running` while work is outstanding.

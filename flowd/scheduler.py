@@ -44,6 +44,42 @@ def backoff_seconds(attempt, base=1.0):
     return float(base) * (2 ** (max(1, int(attempt)) - 1))
 
 
+def validate_max_parallelism(value):
+    """Normalize an optional per-run parallelism quota.
+
+    ``None`` means unlimited; anything else must be an integer greater
+    than zero.  Booleans, floats, strings and non-positive integers are
+    rejected.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise WorkflowError("max_parallelism must be a positive integer",
+                            "bad_max_parallelism")
+    return value
+
+
+def _active_lease_count(run, now):
+    """Count ordinary tasks holding a live lease in ``run`` right now.
+
+    Only steps that are ``running`` with a ``lease_deadline`` strictly in
+    the future occupy a quota slot; approval nodes and steps awaiting
+    retry, succeeded or failed never count.  Each leased task counts one
+    slot, however many a single worker holds.
+    """
+    count = 0
+    for step in run["steps"].values():
+        if step["status"] != STEP_RUNNING:
+            continue
+        if step.get("kind") == KIND_APPROVAL:
+            continue
+        deadline = step.get("lease_deadline")
+        if deadline is None or float(deadline) <= now:
+            continue
+        count += 1
+    return count
+
+
 def _promote_pending(run, now_iso):
     """Promote pending steps whose dependencies all succeeded.
 
@@ -104,13 +140,16 @@ class Scheduler:
     def submit(self, tenant, workflow_id, steps):
         return self.store.save_workflow(tenant, workflow_id, steps)
 
-    def start_run(self, tenant, workflow_id, run_id=None, params=None):
+    def start_run(self, tenant, workflow_id, run_id=None, params=None,
+                  max_parallelism=None):
         plan = self.store.get_workflow(tenant, workflow_id)
+        max_parallelism = validate_max_parallelism(max_parallelism)
         with self.store.locked():
             run_id = run_id or self.store.generate_run_id()
             if self.store.run_exists(run_id) == tenant:
                 raise WorkflowError("run already exists: %s" % run_id, "duplicate_run")
-            run = new_run(tenant, workflow_id, run_id, params, plan, self._iso())
+            run = new_run(tenant, workflow_id, run_id, params, plan, self._iso(),
+                          max_parallelism=max_parallelism)
             self._event(run, run_id, None, "run_created")
             ready, waiting = _promote_pending(run, self._iso())
             for sid in ready:
@@ -172,6 +211,12 @@ class Scheduler:
             candidates = [s for s in run["steps"].values() if s["status"] == STEP_READY]
             index = run["order_index"]
             step = min(candidates, key=lambda s: (index.get(s["id"], 0), s["id"])) if candidates else None
+            if step is not None:
+                quota = run.get("max_parallelism")
+                if quota is not None and _active_lease_count(run, now) >= quota:
+                    # Quota exhausted: ready steps stay ready, no claim is
+                    # recorded, but takeovers/promotions above are still saved.
+                    step = None
             previous = run["status"]
             if step is not None:
                 step.update(status=STEP_RUNNING, worker_id=worker_id, next_attempt_at=None,
@@ -372,7 +417,8 @@ class Scheduler:
         stored = self.get_run(tenant, run_id)
         plan = self.store.get_workflow(tenant, stored["workflow_id"])
         rebuilt = new_run(tenant, stored["workflow_id"], run_id, stored.get("params"), plan,
-                          stored["created_at"])
+                          stored["created_at"],
+                          max_parallelism=stored.get("max_parallelism"))
         steps = rebuilt["steps"]
         for event in stored["history"]:
             sid, etype, at = event.get("step_id"), event.get("type"), event.get("at")

@@ -148,15 +148,17 @@ def normalize_run(run):
     """Backfill fields missing from documents written by older versions.
 
     Steps without ``kind`` predate approval nodes and are ordinary tasks.
+    Runs without ``max_parallelism`` predate quotas and are unlimited.
     Mutates and returns ``run``.
     """
+    run.setdefault("max_parallelism", None)
     for step in run.get("steps", {}).values():
         step.setdefault("kind", KIND_TASK)
         step.setdefault("approval", None)
     return run
 
 
-def new_run(tenant, workflow_id, run_id, params, plan, now_iso):
+def new_run(tenant, workflow_id, run_id, params, plan, now_iso, max_parallelism=None):
     """Build a fresh run document from a validated plan."""
     steps = {
         step["id"]: {
@@ -184,6 +186,7 @@ def new_run(tenant, workflow_id, run_id, params, plan, now_iso):
         "run_id": run_id,
         "status": RUN_PENDING,
         "params": params or {},
+        "max_parallelism": max_parallelism,
         "created_at": now_iso,
         "updated_at": now_iso,
         "step_order": list(plan["order"]),
