@@ -52,6 +52,7 @@ the only accepted values are `task` and `approval`.
 | POST | `/v1/runs/{run_id}/complete` | 200 updated run | 400 bad request, 403, 404 unknown step, 409 lease not held/expired |
 | POST | `/v1/runs/{run_id}/fail` | 200 updated run | 400 bad request, 403, 404 unknown step, 409 lease not held/expired |
 | POST | `/v1/runs/{run_id}/decision` | 200 updated run | 400 bad request/JSON, 403 cross-tenant, 404 unknown run/step, 409 not an approval/not waiting/already decided |
+| POST | `/v1/runs/{run_id}/heartbeat` | 200 updated run | 400 bad request/JSON, 403 cross-tenant, 404 unknown run/step, 409 terminal run/approval node/lease not held/expired |
 | GET | `/v1/runs?tenant=&status=&limit=&after=` | 200 `{"items":[...],"next_after":...}` | 400 missing tenant |
 
 Errors are always `{"error": "<message>"}`.
@@ -76,6 +77,26 @@ strings, illegal values and malformed JSON all return 400.
   `claim` skips them and `complete`/`fail` return 409. They hold no lease fields
   and no `result`/`error`; the `approval` field is `null` until decided and then
   `{"actor","decision","at"}` using the existing UTC format.
+
+### Lease heartbeats
+
+`POST /v1/runs/{run_id}/heartbeat` takes `{"tenant","step_id","worker_id"}` plus
+an optional `lease_seconds` (default 30, must be a finite positive number).
+`tenant`, `step_id` and `worker_id` must be non-empty, non-blank strings and are
+matched as given.
+
+- The holder of a `running` task may renew its lease while `now` is strictly
+  before the current deadline. The new `lease_deadline` is the larger of the
+  current value and `now + lease_seconds`; only the deadline and `updated_at`
+  change — status, holder, attempt, `started_at` and results are untouched and
+  no successor is unlocked.
+- A renewal that would not extend the deadline returns the run unchanged (no
+  history entry, same `updated_at`). An extending renewal appends a `heartbeat`
+  event carrying the new `lease_deadline`.
+- Terminal runs and approval nodes return 409 (`ConflictError`); a non-running
+  step, a holder mismatch or a reached deadline also return 409 (`LeaseError`).
+  Rejected heartbeats change neither state nor history; expired leases are
+  still reclaimed only by `claim`.
 
 ## Step / run state machine
 
@@ -107,7 +128,8 @@ Run states: `pending` -> `running` -> `succeeded` | `failed`.
 
 Every transition appends `{"at","run_id","step_id","type","attempt","worker_id"}`
 to the run's append-only history (a `decision` event additionally carries
-`actor` and `decision`); `Scheduler.replay(run_id)` rebuilds the current
+`actor` and `decision`; `claim` and `heartbeat` events carry `lease_deadline`);
+`Scheduler.replay(run_id)` rebuilds the current
 states from that history and agrees with the stored document.
 
 ## Layout
@@ -115,7 +137,7 @@ states from that history and agrees with the stored document.
 ```
 flowd/model.py      DAG validation + topological order
 flowd/store.py      atomic JSON persistence, tenants, runs, history
-flowd/scheduler.py  claim/complete/fail, leases, retries, replay
+flowd/scheduler.py  claim/heartbeat/complete/fail, leases, retries, replay
 flowd/http_app.py   ThreadingHTTPServer API
 flowd/cli.py        argv parsing and JSON output
 ```

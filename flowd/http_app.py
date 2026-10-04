@@ -95,10 +95,12 @@ class _Handler(BaseHTTPRequestHandler):
                 run = self.scheduler.start_run(self._tenant({}, body), body.get("workflow_id"),
                                                body.get("run_id"), body.get("params"))
                 return self._json(201, _run_view(run))
-            action = re.fullmatch(r"/v1/runs/([^/]+)/(claim|complete|fail|decision)", path)
+            action = re.fullmatch(r"/v1/runs/([^/]+)/(claim|complete|fail|decision|heartbeat)", path)
             if action:
                 if action.group(2) == "decision":
                     return self._decision(action.group(1), self._body())
+                if action.group(2) == "heartbeat":
+                    return self._heartbeat(action.group(1), self._body())
                 return self._step_action(action.group(1), action.group(2), self._body())
         solo = re.fullmatch(r"/v1/runs/([^/]+)", path)
         if method == "GET" and solo:
@@ -135,6 +137,15 @@ class _Handler(BaseHTTPRequestHandler):
         else:
             run = self.scheduler.fail(tenant, run_id, body.get("step_id"), worker_id,
                                       body.get("error"))
+        return self._json(200, _run_view(run))
+
+    def _heartbeat(self, run_id, body):
+        tenant = self._tenant({}, body)
+        owner = self.scheduler.store.run_exists(run_id)
+        if owner is not None and owner != tenant:
+            raise WorkflowError("run %s belongs to another tenant" % run_id, "cross_tenant")
+        run = self.scheduler.heartbeat(tenant, run_id, body.get("step_id"),
+                                       body.get("worker_id"), body.get("lease_seconds", 30))
         return self._json(200, _run_view(run))
 
     def _decision(self, run_id, body):
