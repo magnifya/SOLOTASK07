@@ -6,11 +6,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 from .model import WorkflowError
-from .scheduler import LeaseError
+from .scheduler import ConflictError, LeaseError
 
 MAX_BODY = 1 << 20
 STATUS_FOR_CODE = {"unknown_run": 404, "unknown_workflow": 404, "unknown_step": 404,
                    "cross_tenant": 403}
+DECISIONS = ("approve", "reject")
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -55,7 +56,6 @@ class _Handler(BaseHTTPRequestHandler):
         if not tenant:
             raise WorkflowError("tenant is required", "bad_tenant")
         return tenant
-
     # -- verbs ---------------------------------------------------------
     def do_GET(self):
         self._dispatch("GET")
@@ -69,6 +69,8 @@ class _Handler(BaseHTTPRequestHandler):
         try:
             self._route(method, path, parse_qs(parsed.query))
         except LeaseError as exc:
+            self._error(409, exc.message)
+        except ConflictError as exc:
             self._error(409, exc.message)
         except WorkflowError as exc:
             self._error(STATUS_FOR_CODE.get(exc.code, 400), exc.message)
@@ -93,8 +95,10 @@ class _Handler(BaseHTTPRequestHandler):
                 run = self.scheduler.start_run(self._tenant({}, body), body.get("workflow_id"),
                                                body.get("run_id"), body.get("params"))
                 return self._json(201, _run_view(run))
-            action = re.fullmatch(r"/v1/runs/([^/]+)/(claim|complete|fail)", path)
+            action = re.fullmatch(r"/v1/runs/([^/]+)/(claim|complete|fail|decision)", path)
             if action:
+                if action.group(2) == "decision":
+                    return self._decision(action.group(1), self._body())
                 return self._step_action(action.group(1), action.group(2), self._body())
         solo = re.fullmatch(r"/v1/runs/([^/]+)", path)
         if method == "GET" and solo:
@@ -133,13 +137,33 @@ class _Handler(BaseHTTPRequestHandler):
                                       body.get("error"))
         return self._json(200, _run_view(run))
 
+    def _decision(self, run_id, body):
+        """Validate strictly; any missing/blank/wrong-type field is a 400."""
+        fields = {}
+        for name in ("tenant", "step_id", "actor"):
+            value = body.get(name)
+            if not isinstance(value, str) or not value.strip():
+                raise WorkflowError("%s must be a non-empty string" % name, "bad_%s" % name)
+            fields[name] = value.strip()
+        decision = body.get("decision")
+        if decision not in DECISIONS:
+            raise WorkflowError("decision must be one of %s" % ", ".join(DECISIONS),
+                                "bad_decision")
+        tenant = fields["tenant"]
+        owner = self.scheduler.store.run_exists(run_id)
+        if owner is not None and owner != tenant:
+            raise WorkflowError("run %s belongs to another tenant" % run_id, "cross_tenant")
+        run = self.scheduler.decide(tenant, run_id, fields["step_id"], fields["actor"], decision)
+        return self._json(200, _run_view(run))
+
 
 def _step_view(step):
-    return {"id": step["id"], "status": step["status"], "attempt": step["attempt"],
+    return {"id": step["id"], "kind": step.get("kind", "task"), "status": step["status"],
+            "attempt": step["attempt"],
             "max_attempts": step["max_attempts"], "depends_on": list(step["depends_on"]),
             "worker_id": step["worker_id"], "lease_deadline": step["lease_deadline"],
             "next_attempt_at": step["next_attempt_at"], "result": step.get("result"),
-            "error": step.get("error")}
+            "error": step.get("error"), "approval": step.get("approval")}
 
 
 def _run_view(run):

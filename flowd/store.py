@@ -17,7 +17,7 @@ import time as _time
 import uuid
 from contextlib import contextmanager
 
-from .model import WorkflowError, format_time, plan_workflow
+from .model import KIND_TASK, WorkflowError, format_time, plan_workflow
 
 RUN_PENDING = "pending"
 RUN_RUNNING = "running"
@@ -27,6 +27,7 @@ RUN_FAILED = "failed"
 STEP_PENDING = "pending"
 STEP_READY = "ready"
 STEP_RUNNING = "running"
+STEP_WAITING = "waiting"
 STEP_SUCCEEDED = "succeeded"
 STEP_FAILED = "failed"
 
@@ -116,7 +117,7 @@ class WorkflowStore:
         run = read_json(self.run_path(tenant, run_id), None)
         if run is None:
             raise WorkflowError("unknown run: %s" % run_id, "unknown_run")
-        return run
+        return normalize_run(run)
 
     def run_exists(self, run_id):
         """Return the tenant owning ``run_id``, or ``None``."""
@@ -131,7 +132,7 @@ class WorkflowStore:
         for name in sorted(os.listdir(runs_dir)) if os.path.isdir(runs_dir) else []:
             run = read_json(os.path.join(runs_dir, name), None) if name.endswith(".json") else None
             if run is not None:
-                items.append(run)
+                items.append(normalize_run(run))
         items.sort(key=lambda r: (r.get("created_at", ""), r.get("run_id", "")))
         if status:
             items = [r for r in items if r.get("status") == status]
@@ -143,11 +144,24 @@ class WorkflowStore:
         return page, (page[-1]["run_id"] if len(items) > limit else None)
 
 
+def normalize_run(run):
+    """Backfill fields missing from documents written by older versions.
+
+    Steps without ``kind`` predate approval nodes and are ordinary tasks.
+    Mutates and returns ``run``.
+    """
+    for step in run.get("steps", {}).values():
+        step.setdefault("kind", KIND_TASK)
+        step.setdefault("approval", None)
+    return run
+
+
 def new_run(tenant, workflow_id, run_id, params, plan, now_iso):
     """Build a fresh run document from a validated plan."""
     steps = {
         step["id"]: {
             "id": step["id"],
+            "kind": step.get("kind", KIND_TASK),
             "depends_on": list(step["depends_on"]),
             "max_attempts": step["max_attempts"],
             "status": STEP_PENDING,
@@ -160,6 +174,7 @@ def new_run(tenant, workflow_id, run_id, params, plan, now_iso):
             "finished_at": None,
             "result": None,
             "error": None,
+            "approval": None,
         }
         for step in plan["steps"]
     }

@@ -13,9 +13,13 @@ order is deterministic.
 import heapq
 import time as _time
 
-STEP_STATES = ("pending", "ready", "running", "succeeded", "failed")
+STEP_STATES = ("pending", "ready", "running", "waiting", "succeeded", "failed")
 RUN_STATES = ("pending", "running", "succeeded", "failed")
 DEFAULT_MAX_ATTEMPTS = 3
+
+KIND_TASK = "task"
+KIND_APPROVAL = "approval"
+STEP_KINDS = (KIND_TASK, KIND_APPROVAL)
 
 
 class WorkflowError(Exception):
@@ -67,7 +71,14 @@ def validate_step(raw, index, seen_ids):
         raise WorkflowError("step %s: max_attempts must be an integer" % step_id, "bad_max_attempts")
     if max_attempts < 1:
         raise WorkflowError("step %s: max_attempts must be >= 1" % step_id, "bad_max_attempts")
-    return {"id": step_id, "depends_on": depends_on, "max_attempts": max_attempts}
+    kind = raw.get("kind")
+    if kind is None:
+        kind = KIND_TASK
+    if not isinstance(kind, str) or kind not in STEP_KINDS:
+        raise WorkflowError(
+            "step %s: kind must be one of %s" % (step_id, ", ".join(STEP_KINDS)), "bad_kind"
+        )
+    return {"id": step_id, "depends_on": depends_on, "max_attempts": max_attempts, "kind": kind}
 
 
 def topo_order(steps):
