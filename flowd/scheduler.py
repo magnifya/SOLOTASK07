@@ -8,7 +8,7 @@ from that history and must agree with the stored document.
 import math
 import time as _time
 
-from .model import KIND_APPROVAL, WorkflowError, format_time
+from .model import KIND_APPROVAL, KIND_TASK, WorkflowError, format_time
 from .store import (
     RUN_FAILED,
     RUN_PENDING,
@@ -42,6 +42,38 @@ class ConflictError(WorkflowError):
 def backoff_seconds(attempt, base=1.0):
     """Exponential backoff: ``base * 2 ** (attempt - 1)``."""
     return float(base) * (2 ** (max(1, int(attempt)) - 1))
+
+
+def normalize_max_parallelism(value):
+    """Validate an optional per-run concurrency quota.
+
+    ``None`` means unlimited; only positive integers are accepted (booleans,
+    floats, strings and non-positive integers are rejected).
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise WorkflowError(
+            "max_parallelism must be a positive integer or null", "bad_max_parallelism"
+        )
+    return int(value)
+
+
+def _active_lease_count(run, now):
+    """Count ordinary tasks in this run holding a strictly unexpired lease.
+
+    Approval nodes and tasks that are ready, waiting, succeeded, failed or
+    pending retry do not count; a deadline equal to ``now`` is expired.
+    Each held task counts once, even when one worker holds several.
+    """
+    return sum(
+        1
+        for step in run["steps"].values()
+        if step.get("kind") != KIND_APPROVAL
+        and step["status"] == STEP_RUNNING
+        and step.get("lease_deadline") is not None
+        and float(step["lease_deadline"]) > now
+    )
 
 
 def _promote_pending(run, now_iso):
@@ -104,13 +136,15 @@ class Scheduler:
     def submit(self, tenant, workflow_id, steps):
         return self.store.save_workflow(tenant, workflow_id, steps)
 
-    def start_run(self, tenant, workflow_id, run_id=None, params=None):
+    def start_run(self, tenant, workflow_id, run_id=None, params=None, max_parallelism=None):
+        max_parallelism = normalize_max_parallelism(max_parallelism)
         plan = self.store.get_workflow(tenant, workflow_id)
         with self.store.locked():
             run_id = run_id or self.store.generate_run_id()
             if self.store.run_exists(run_id) == tenant:
                 raise WorkflowError("run already exists: %s" % run_id, "duplicate_run")
-            run = new_run(tenant, workflow_id, run_id, params, plan, self._iso())
+            run = new_run(tenant, workflow_id, run_id, params, plan, self._iso(),
+                          max_parallelism=max_parallelism)
             self._event(run, run_id, None, "run_created")
             ready, waiting = _promote_pending(run, self._iso())
             for sid in ready:
@@ -171,7 +205,10 @@ class Scheduler:
                 self._event(run, run_id, sid, "waiting", attempt=0)
             candidates = [s for s in run["steps"].values() if s["status"] == STEP_READY]
             index = run["order_index"]
-            step = min(candidates, key=lambda s: (index.get(s["id"], 0), s["id"])) if candidates else None
+            quota = run.get("max_parallelism")
+            at_quota = quota is not None and _active_lease_count(run, now) >= int(quota)
+            step = (min(candidates, key=lambda s: (index.get(s["id"], 0), s["id"]))
+                    if candidates and not at_quota else None)
             previous = run["status"]
             if step is not None:
                 step.update(status=STEP_RUNNING, worker_id=worker_id, next_attempt_at=None,
@@ -372,7 +409,8 @@ class Scheduler:
         stored = self.get_run(tenant, run_id)
         plan = self.store.get_workflow(tenant, stored["workflow_id"])
         rebuilt = new_run(tenant, stored["workflow_id"], run_id, stored.get("params"), plan,
-                          stored["created_at"])
+                          stored["created_at"],
+                          max_parallelism=stored.get("max_parallelism"))
         steps = rebuilt["steps"]
         for event in stored["history"]:
             sid, etype, at = event.get("step_id"), event.get("type"), event.get("at")

@@ -46,7 +46,7 @@ the only accepted values are `task` and `approval`.
 | --- | --- | --- | --- |
 | GET | `/healthz` | 200 `{"ok":true}` | - |
 | POST | `/v1/workflows` | 201 validated plan | 400 validation error, 400 bad JSON |
-| POST | `/v1/runs` | 201 run | 400 bad request, 404 unknown workflow |
+| POST | `/v1/runs` | 201 run | 400 bad request/max_parallelism, 404 unknown workflow |
 | GET | `/v1/runs/{run_id}?tenant=` | 200 run with step states | 400 missing tenant, 403 cross-tenant, 404 unknown run |
 | POST | `/v1/runs/{run_id}/claim` | 200 `{"step":...}`, 204 nothing ready | 400 bad request, 403 cross-tenant, 404 unknown run |
 | POST | `/v1/runs/{run_id}/complete` | 200 updated run | 400 bad request, 403, 404 unknown step, 409 lease not held/expired |
@@ -56,6 +56,29 @@ the only accepted values are `task` and `approval`.
 | GET | `/v1/runs?tenant=&status=&limit=&after=` | 200 `{"items":[...],"next_after":...}` | 400 missing tenant |
 
 Errors are always `{"error": "<message>"}`.
+
+### Per-run concurrency quota
+
+`POST /v1/runs` (and `Scheduler.start_run`) accept an optional
+`max_parallelism`: the maximum number of simultaneously valid task leases the
+run may hold. Omit it or pass `null` for unlimited; otherwise it must be a
+positive integer. Booleans, floats, strings and non-positive integers are
+rejected (Python raises `WorkflowError`, HTTP returns 400) and no run is
+created. The quota is fixed at creation time and reported as `max_parallelism`
+on the create response, run details, the run listing and `flowd status`; runs
+written by older versions read back as `null`.
+
+Only ordinary tasks that are `running` with `lease_deadline` strictly greater
+than the current time count toward the quota; a deadline equal to the current
+time is expired. Approval nodes and ready, waiting, pending-retry, succeeded
+or failed tasks hold no slot, and one worker holding several tasks is counted
+once per task. Expired leases are reclaimed via the usual takeover rules
+before slots are counted; `heartbeat` only extends an existing lease and never
+takes or releases a slot. When the quota is full, `Scheduler.claim` returns
+`None`, HTTP claim returns 204 and the CLI prints its existing `step: null`
+JSON: ready tasks stay ready and no claim history is appended (takeover
+entries from leases reclaimed by the same call are still recorded). Quotas
+are counted per `run_id`, so runs and tenants never share slots.
 
 ### Approval decisions
 
