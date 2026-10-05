@@ -8,7 +8,8 @@ a small JSON HTTP API. Standard library only: no pip installs, no network
 access, no third-party imports.
 
 Data lives in a single directory: `<root>/<tenant>/workflows.json`,
-`<root>/<tenant>/idempotency.json` (idempotency-key → run bindings) plus
+`<root>/<tenant>/idempotency.json` (idempotency-key → run bindings),
+`<root>/<tenant>/workers.json` (worker registrations) plus
 `<root>/<tenant>/runs/<run_id>.json`, written atomically, so restarting the
 process sees exactly the same state.
 
@@ -49,11 +50,14 @@ the only accepted values are `task` and `approval`.
 | POST | `/v1/workflows` | 201 validated plan | 400 validation error, 400 bad JSON |
 | POST | `/v1/runs` | 201 run (new or replayed) | 400 bad request/max_parallelism/idempotency_key/params/not_before, 404 unknown workflow, 409 idempotency conflict |
 | GET | `/v1/runs/{run_id}?tenant=` | 200 run with step states | 400 missing tenant, 403 cross-tenant, 404 unknown run |
-| POST | `/v1/runs/{run_id}/claim` | 200 `{"step":...}`, 204 nothing ready | 400 bad request, 403 cross-tenant, 404 unknown run |
+| POST | `/v1/runs/{run_id}/claim` | 200 `{"step":...}`, 204 nothing ready | 400 bad request, 403 cross-tenant, 404 unknown run, 409 worker not registered/expired |
 | POST | `/v1/runs/{run_id}/complete` | 200 updated run | 400 bad request, 403, 404 unknown step, 409 lease not held/expired |
 | POST | `/v1/runs/{run_id}/fail` | 200 updated run | 400 bad request, 403, 404 unknown step, 409 lease not held/expired |
 | POST | `/v1/runs/{run_id}/decision` | 200 updated run | 400 bad request/JSON, 403 cross-tenant, 404 unknown run/step, 409 not an approval/not waiting/already decided |
 | POST | `/v1/runs/{run_id}/heartbeat` | 200 updated run | 400 bad request/JSON, 403 cross-tenant, 404 unknown run/step, 409 finished run/approval node/lease not held/expired |
+| POST | `/v1/workers/register` | 201 new registration, 200 refreshed registration | 400 bad tenant/worker_id/lease_seconds/JSON |
+| POST | `/v1/workers/{worker_id}/heartbeat` | 200 registration record | 400 bad tenant/lease_seconds/JSON, 404 unknown worker, 409 worker_expired |
+| GET | `/v1/workers?tenant=` | 200 `{"tenant":...,"items":[...]}` sorted by worker_id | 400 missing tenant |
 | GET | `/v1/runs?tenant=&status=&limit=&after=` | 200 `{"items":[...],"next_after":...}` | 400 missing tenant |
 
 Errors are always `{"error": "<message>"}`.
@@ -186,6 +190,47 @@ strings, illegal values and malformed JSON all return 400.
   `claim` skips them and `complete`/`fail` return 409. They hold no lease fields
   and no `result`/`error`; the `approval` field is `null` until decided and then
   `{"actor","decision","at"}` using the existing UTC format.
+
+### Worker registration and health
+
+Workers may register with a tenant so claim traffic can be limited to live,
+known workers. Registration is opt-in per tenant: until a tenant has any
+registration record, claims keep the legacy rule (any non-empty
+`worker_id`). The moment at least one record exists, claims are gated.
+
+- `POST /v1/workers/register` takes `{"tenant","worker_id","lease_seconds"?}`
+  (default 30). `tenant` and `worker_id` are trimmed and must be non-empty;
+  `lease_seconds` must be a finite number strictly greater than zero
+  (booleans, strings, `null`, zero, negatives, `NaN` and infinities return
+  400 and write nothing). The trimmed `worker_id` is what is stored. The
+  first registration for a `(tenant, worker_id)` returns **201**; a repeat
+  registration returns **200** and refreshes the expiry while preserving the
+  original `registered_at`.
+- The response is
+  `{"worker_id","status","registered_at","last_heartbeat","expires_at"}`.
+  `status` is `active` while the current time is strictly earlier than
+  `expires_at`, otherwise `expired`; it is recomputed on every read.
+- `POST /v1/workers/{worker_id}/heartbeat` takes
+  `{"tenant","lease_seconds"?}` and sets the expiry to the later of the
+  current expiry and `now + lease_seconds` (it never shortens). An unknown
+  worker returns 404 (`unknown_worker`); an expired worker returns 409
+  (`worker_expired`) and must re-register. Success returns the record.
+- `GET /v1/workers?tenant=` returns the tenant's records sorted by
+  `worker_id` with live status; a missing/blank tenant returns 400.
+- Once the tenant has any records, `claim` accepts only an `active`
+  registration belonging to that same tenant: an unregistered id returns 409
+  (`worker_not_registered`), an expired registration 409
+  (`worker_expired`), and another tenant's worker still returns 403 (checked
+  first). Empty/blank `worker_id` remains 400. Empty tenants and tenants with
+  no records are unaffected, as are `complete`/`fail` lease checks, the
+  run-level lease `heartbeat`, expiry/takeover, task ordering and the 204
+  "nothing ready" response.
+
+Registrations live in `<tenant>/workers.json` (atomic writes) and survive a
+process restart over the same directory; status is always derived from
+`expires_at`, so no background reaper is needed. Registration, worker
+heartbeats and listing append nothing to any run's history and never touch
+`updated_at`, leases, approvals, quotas or replay.
 
 ## Step / run state machine
 

@@ -3,14 +3,14 @@
 import json
 import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from .model import WorkflowError
 from .scheduler import ConflictError, LeaseError
 
 MAX_BODY = 1 << 20
 STATUS_FOR_CODE = {"unknown_run": 404, "unknown_workflow": 404, "unknown_step": 404,
-                   "cross_tenant": 403}
+                   "unknown_worker": 404, "cross_tenant": 403}
 DECISIONS = ("approve", "reject")
 
 
@@ -84,7 +84,14 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._json(200, {"ok": True})
             if path == "/v1/runs":
                 return self._list_runs(query)
+            if path == "/v1/workers":
+                return self._list_workers(query)
         elif method == "POST":
+            if path == "/v1/workers/register":
+                return self._register_worker(self._body())
+            worker_beat = re.fullmatch(r"/v1/workers/([^/]+)/heartbeat", path)
+            if worker_beat:
+                return self._worker_heartbeat(unquote(worker_beat.group(1)), self._body())
             if path == "/v1/workflows":
                 body = self._body()
                 tenant = self._tenant({}, body)
@@ -128,6 +135,33 @@ class _Handler(BaseHTTPRequestHandler):
         )
         return self._json(200, {"tenant": tenant, "items": [_run_view(r) for r in items],
                                 "next_after": next_after})
+
+    # -- worker registry -----------------------------------------------
+    def _worker_lease(self, body):
+        """Extract lease_seconds: omitted defaults to 30, explicit null is 400."""
+        if "lease_seconds" not in body:
+            return 30
+        lease = body["lease_seconds"]
+        if lease is None:
+            raise WorkflowError("lease_seconds must be a positive number", "bad_lease")
+        return lease
+
+    def _register_worker(self, body):
+        record, created = self.scheduler.register_worker(
+            body.get("tenant"), body.get("worker_id"), self._worker_lease(body)
+        )
+        return self._json(201 if created else 200, record)
+
+    def _worker_heartbeat(self, worker_id, body):
+        record = self.scheduler.heartbeat_worker(
+            body.get("tenant"), worker_id, self._worker_lease(body)
+        )
+        return self._json(200, record)
+
+    def _list_workers(self, query):
+        tenant = self._tenant(query)
+        return self._json(200, {"tenant": tenant,
+                                "items": self.scheduler.list_workers(tenant)})
 
     def _step_action(self, run_id, action, body):
         tenant, worker_id = self._tenant({}, body), body.get("worker_id")

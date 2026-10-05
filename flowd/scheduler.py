@@ -39,6 +39,11 @@ class ConflictError(WorkflowError):
         super().__init__(message, code)
 
 
+WORKER_ACTIVE = "active"
+WORKER_EXPIRED = "expired"
+DEFAULT_WORKER_LEASE = 30
+
+
 def backoff_seconds(attempt, base=1.0):
     """Exponential backoff: ``base * 2 ** (attempt - 1)``."""
     return float(base) * (2 ** (max(1, int(attempt)) - 1))
@@ -74,6 +79,46 @@ def normalize_idempotency_key(value):
     if not key:
         raise WorkflowError("idempotency_key must be a non-empty string", "bad_idempotency_key")
     return key
+
+
+def normalize_tenant(value):
+    """Validate a tenant: a string that is non-empty after trimming."""
+    if not isinstance(value, str):
+        raise WorkflowError("tenant must be a string", "bad_tenant")
+    tenant = value.strip()
+    if not tenant:
+        raise WorkflowError("tenant must be a non-empty string", "bad_tenant")
+    return tenant
+
+
+def normalize_worker_id(value):
+    """Validate a worker id: a string that is non-empty after trimming."""
+    if not isinstance(value, str):
+        raise WorkflowError("worker_id must be a string", "bad_worker")
+    worker_id = value.strip()
+    if not worker_id:
+        raise WorkflowError("worker_id must be a non-empty string", "bad_worker")
+    return worker_id
+
+
+def normalize_worker_lease(value):
+    """Validate an optional worker-registration lease in seconds.
+
+    ``None`` (omitted) defaults to 30 seconds.  Otherwise the value must be
+    a finite number strictly greater than zero; booleans, strings, NaN and
+    infinities are rejected.
+    """
+    if value is None:
+        return float(DEFAULT_WORKER_LEASE)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise WorkflowError("lease_seconds must be a positive number", "bad_lease")
+    try:
+        seconds = float(value)
+    except OverflowError:
+        seconds = float("inf")
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise WorkflowError("lease_seconds must be a positive number", "bad_lease")
+    return seconds
 
 
 def normalize_params(value):
@@ -322,6 +367,124 @@ class Scheduler:
                 raise WorkflowError("unknown run: %s" % run_id, "unknown_run")
         return list(self.get_run(tenant, run_id)["history"])
 
+    # -- worker registry -----------------------------------------------
+    def _worker_view(self, record, now=None):
+        """Project a stored registration record with live status."""
+        now = self.now() if now is None else now
+        deadline = float(record["expires_at_epoch"])
+        return {
+            "worker_id": record["worker_id"],
+            "status": WORKER_ACTIVE if now < deadline else WORKER_EXPIRED,
+            "registered_at": record["registered_at"],
+            "last_heartbeat": record["last_heartbeat"],
+            "expires_at": record["expires_at"],
+        }
+
+    def register_worker(self, tenant, worker_id, lease_seconds=None):
+        """Register ``worker_id`` for ``tenant`` (or refresh its expiry).
+
+        Returns ``(record, created)`` where ``created`` is ``True`` for the
+        first registration (HTTP 201) and ``False`` for a repeat that
+        refreshed an existing record (HTTP 200).  Registration never writes
+        run history.
+        """
+        tenant = normalize_tenant(tenant)
+        worker_id = normalize_worker_id(worker_id)
+        lease = normalize_worker_lease(lease_seconds)
+        now = self.now()
+        with self.store.locked():
+            workers = self.store.load_workers(tenant)
+            existing = workers.get(worker_id)
+            deadline = now + lease
+            at = self._iso(now)
+            if existing is None:
+                record = {
+                    "worker_id": worker_id,
+                    "registered_at": at,
+                    "last_heartbeat": at,
+                    "expires_at": self._iso(deadline),
+                    "expires_at_epoch": deadline,
+                }
+                created = True
+            else:
+                # A repeat registration simply refreshes the expiry; the
+                # original registered_at is preserved.
+                record = dict(existing)
+                record.update(last_heartbeat=at, expires_at=self._iso(deadline),
+                              expires_at_epoch=deadline)
+                created = False
+            workers[worker_id] = record
+            self.store.save_workers(tenant, workers)
+            return self._worker_view(record, now), created
+
+    def heartbeat_worker(self, tenant, worker_id, lease_seconds=None):
+        """Heartbeat a registered worker.
+
+        The new expiry is the later of the old one and ``now +
+        lease_seconds``.  Unknown workers raise ``unknown_worker`` (404) and
+        workers whose registration has expired raise ``worker_expired``
+        (409); an expired worker must re-register.
+        """
+        tenant = normalize_tenant(tenant)
+        worker_id = normalize_worker_id(worker_id)
+        lease = normalize_worker_lease(lease_seconds)
+        now = self.now()
+        with self.store.locked():
+            workers = self.store.load_workers(tenant)
+            record = workers.get(worker_id)
+            if record is None:
+                raise WorkflowError("unknown worker: %s" % worker_id, "unknown_worker")
+            if now >= float(record["expires_at_epoch"]):
+                raise ConflictError(
+                    "worker_expired: registration of worker %s has expired; re-register"
+                    % worker_id,
+                    "worker_expired",
+                )
+            deadline = max(float(record["expires_at_epoch"]), now + lease)
+            record = dict(record)
+            record.update(last_heartbeat=self._iso(now), expires_at=self._iso(deadline),
+                          expires_at_epoch=deadline)
+            workers[worker_id] = record
+            self.store.save_workers(tenant, workers)
+            return self._worker_view(record, now)
+
+    def list_workers(self, tenant):
+        """Return the tenant's worker records sorted by worker_id.
+
+        Status is computed against the current time on every call, so
+        expired workers are reported without any background reaper.
+        """
+        tenant = normalize_tenant(tenant)
+        now = self.now()
+        with self.store.locked():
+            workers = self.store.load_workers(tenant)
+            return [self._worker_view(workers[worker_id], now)
+                    for worker_id in sorted(workers)]
+
+    def _check_worker_registration(self, tenant, worker_id, now):
+        """Gate claims against the tenant's worker registry.
+
+        A tenant with no registration records keeps the legacy rule (any
+        non-empty worker_id).  Once any record exists the caller must be a
+        registered worker whose registration is strictly unexpired.
+        """
+        workers = self.store.load_workers(tenant)
+        if not workers:
+            return
+        record = workers.get(worker_id)
+        if record is None:
+            raise ConflictError(
+                "worker_not_registered: worker %s is not registered for tenant %s"
+                % (worker_id, tenant),
+                "worker_not_registered",
+            )
+        if now >= float(record["expires_at_epoch"]):
+            raise ConflictError(
+                "worker_expired: registration of worker %s has expired; re-register"
+                % worker_id,
+                "worker_expired",
+            )
+
     # -- lease expiry --------------------------------------------------
     def _expire_leases(self, run, now):
         """Release leases past their deadline; each one records a takeover."""
@@ -348,6 +511,10 @@ class Scheduler:
         start time opens the root nodes (one ``ready``/``waiting`` event each)
         and then leases at most one task under the usual order and quota; a
         run whose roots are all approvals activates and still returns ``None``.
+
+        Once the tenant has any registered worker the claim must come from an
+        active registration (``worker_not_registered`` / ``worker_expired``);
+        a tenant with no registrations keeps the legacy non-empty-id rule.
         """
         if not isinstance(worker_id, str) or not worker_id.strip():
             raise WorkflowError("worker_id must be a non-empty string", "bad_worker")
@@ -356,6 +523,13 @@ class Scheduler:
             raise WorkflowError("lease_seconds must be a positive number", "bad_lease")
         now = self.now()
         with self.store.locked():
+            owner = self.store.run_exists(run_id)
+            if owner is not None and owner != tenant:
+                raise WorkflowError("run %s belongs to another tenant" % run_id, "cross_tenant")
+            # Once a tenant has any registered worker, claims require an
+            # active registration; a tenant without records keeps the legacy
+            # "any non-empty worker_id" rule.
+            self._check_worker_registration(tenant, worker_id.strip(), now)
             run = self.get_run(tenant, run_id)
             not_before = run.get("not_before")
             if not_before is not None and float(not_before) > now:

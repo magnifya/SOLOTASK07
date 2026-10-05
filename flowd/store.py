@@ -4,6 +4,7 @@ Layout::
 
     <root>/<tenant>/workflows.json
     <root>/<tenant>/idempotency.json
+    <root>/<tenant>/workers.json
     <root>/<tenant>/runs/<run_id>.json
 
 Every write is atomic (temp file + ``os.replace``) so a crash cannot leave a
@@ -88,6 +89,9 @@ class WorkflowStore:
     def idempotency_path(self, tenant):
         return os.path.join(self.tenant_dir(tenant), "idempotency.json")
 
+    def workers_path(self, tenant):
+        return os.path.join(self.tenant_dir(tenant), "workers.json")
+
     def run_path(self, tenant, run_id):
         return os.path.join(self.tenant_dir(tenant), "runs", "%s.json" % run_id)
 
@@ -119,6 +123,15 @@ class WorkflowStore:
 
     def save_idempotency(self, tenant, index):
         atomic_write_json(self.idempotency_path(tenant), index)
+        return index
+
+    # -- worker registry ----------------------------------------------
+    def load_workers(self, tenant):
+        """Return the tenant's ``{worker_id: registration record}`` map."""
+        return read_json(self.workers_path(tenant), {}) or {}
+
+    def save_workers(self, tenant, index):
+        atomic_write_json(self.workers_path(tenant), index)
         return index
 
     # -- runs ----------------------------------------------------------
