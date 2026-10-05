@@ -52,6 +52,7 @@ the only accepted values are `task` and `approval`.
 | POST | `/v1/runs` | 201 run (new or replayed) | 400 bad request/max_parallelism/idempotency_key/params/not_before, 404 unknown workflow, 409 idempotency conflict |
 | GET | `/v1/runs/{run_id}?tenant=` | 200 run with step states | 400 missing tenant, 403 cross-tenant, 404 unknown run |
 | POST | `/v1/runs/{run_id}/claim` | 200 `{"step":...}`, 204 nothing ready | 400 bad request, 403 cross-tenant, 404 unknown run, 409 worker not registered/expired |
+| POST | `/v1/tasks/claim` | 200 `{"run_id":...,"step":...}`, 204 nothing claimable | 400 bad tenant/worker_id/lease_seconds/JSON, 409 worker not registered/expired |
 | POST | `/v1/runs/{run_id}/complete` | 200 updated run | 400 bad request, 403, 404 unknown step, 409 lease not held/expired |
 | POST | `/v1/runs/{run_id}/fail` | 200 updated run | 400 bad request, 403, 404 unknown step, 409 lease not held/expired |
 | POST | `/v1/runs/{run_id}/decision` | 200 updated run | 400 bad request/JSON, 403 cross-tenant, 404 unknown run/step, 409 not an approval/not waiting/already decided |
@@ -65,6 +66,45 @@ the only accepted values are `task` and `approval`.
 | GET | `/v1/runs?tenant=&status=&limit=&after=` | 200 `{"items":[...],"next_after":...}` | 400 missing tenant |
 
 Errors are always `{"error": "<message>"}`.
+
+### Tenant-wide fair claim
+
+`POST /v1/tasks/claim` (`Scheduler.claim_fair`) leases one task from the
+tenant's least-claimed eligible run, without naming a run:
+
+```json
+{"tenant": "acme", "worker_id": "w1", "lease_seconds": 30}
+```
+
+`tenant` and `worker_id` are trimmed and must be non-empty (`bad_tenant` /
+`bad_worker`); `lease_seconds` may be omitted (default 30) and otherwise
+must be a finite number strictly greater than zero (`bad_lease`); malformed
+JSON or a non-object body is `bad_json`. All are 400. Once the tenant has
+any worker registration the same gate as the single-run claim applies:
+unregistered workers get 409 `worker_not_registered`, expired ones 409
+`worker_expired`.
+
+The call scans the tenant's runs. First, sleeping runs whose `not_before`
+has come due are activated (root nodes opened, one `ready`/`waiting` event
+each) in `run_id` order. Then, among the candidates — runs that are not
+terminal, not still sleeping, hold at least one `ready` ordinary task
+(approval-only runs never qualify) and have not reached their
+`max_parallelism` — the winner is chosen by fairness: fewest `claim`
+events in the run's history, then `created_at`, then `run_id`. Expired
+leases are reclaimed with the usual `takeover` events before slots are
+counted, exactly like the single-run claim, and those events are recorded
+even when the run is not selected. The winner leases its next task in
+`(topological index, step id)` order, recording the usual `claim` and, when
+the run leaves `pending`, `run_started` events.
+
+Success returns 200 with `{"run_id": ..., "step": ...}` where `step` is the
+same object the single-run claim returns. When no run is eligible the
+response is 204 and no `claim` event is appended. At most one task is
+leased per call. The fairness count is rebuilt from the append-only
+history on every call, so restarts, `Scheduler.replay` and concurrent
+requests (serialized by the store lock) all agree on the same choice. Only
+the tenant's own runs are scanned; every other endpoint is unchanged.
+
 
 ### Per-run concurrency quota
 

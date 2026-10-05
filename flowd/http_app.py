@@ -90,6 +90,8 @@ class _Handler(BaseHTTPRequestHandler):
             if path == "/v1/workers":
                 return self._list_workers(query)
         elif method == "POST":
+            if path == "/v1/tasks/claim":
+                return self._claim_any_task(self._body())
             if path == "/v1/workers/register":
                 return self._register_worker(self._body())
             worker_beat = re.fullmatch(r"/v1/workers/([^/]+)/heartbeat", path)
@@ -192,6 +194,17 @@ class _Handler(BaseHTTPRequestHandler):
         tenant = self._tenant(query)
         return self._json(200, {"tenant": tenant,
                                 "items": self.scheduler.list_workers(tenant)})
+
+    def _claim_any_task(self, body):
+        """Tenant-wide fair claim: 200 {"run_id","step"} or 204 when idle."""
+        lease = body.get("lease_seconds", 30)
+        if lease is None:
+            raise WorkflowError("lease_seconds must be a positive number", "bad_lease")
+        result = self.scheduler.claim_fair(body.get("tenant"), body.get("worker_id"), lease)
+        if result is None:
+            return self._send(204)
+        run_id, step = result
+        return self._json(200, {"run_id": run_id, "step": _step_view(step)})
 
     def _step_action(self, run_id, action, body):
         tenant, worker_id = self._tenant({}, body), body.get("worker_id")

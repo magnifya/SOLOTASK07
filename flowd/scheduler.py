@@ -20,6 +20,7 @@ from .store import (
     STEP_RUNNING,
     STEP_SUCCEEDED,
     STEP_WAITING,
+    TERMINAL_RUN_STATES,
     WorkflowStore,
     new_run,
 )
@@ -296,6 +297,16 @@ def _derive_run_status(run):
     if any(s["status"] in (STEP_RUNNING, STEP_SUCCEEDED) for s in steps):
         return RUN_RUNNING
     return RUN_PENDING
+
+
+def _roots_opened(run):
+    """Whether the run's root nodes were already opened (activation done).
+
+    A sleeping (delayed) run has exactly one history event, ``run_created``;
+    activation appends one ``ready``/``waiting`` event per root node, and a
+    validated workflow always has at least one root.
+    """
+    return any(e.get("type") in ("ready", "waiting") for e in run.get("history") or [])
 
 
 class Scheduler:
@@ -712,6 +723,88 @@ class Scheduler:
             run["updated_at"] = self._iso()
             self.store.save_run(run)
             return dict(step) if step is not None else None
+
+    def claim_fair(self, tenant, worker_id, lease_seconds=30):
+        """Lease one task from the tenant's least-claimed eligible run.
+
+        Scans every run of the tenant.  First, sleeping runs whose
+        ``not_before`` has come due are activated (root nodes opened, one
+        ``ready``/``waiting`` event each) in ``run_id`` order.  Then the
+        candidates — runs that are not terminal, not still sleeping, hold at
+        least one ``ready`` ordinary task and have not reached their
+        ``max_parallelism`` — are ordered by fairness: the number of
+        ``claim`` events in the run's history (fewest first), then
+        ``created_at``, then ``run_id``.  Expired leases are reclaimed with
+        the usual ``takeover`` events before slots are counted, exactly like
+        the single-run claim.  The winner leases its next task in
+        ``(topological index, step id)`` order, recording the usual ``claim``
+        and, when the run leaves ``pending``, ``run_started`` events.
+
+        Returns ``(run_id, step)`` or ``None`` when no run is eligible; at
+        most one task is leased per call.  The fairness count is rebuilt
+        from the append-only history on every call, so restarts, replay and
+        concurrent callers (serialized by the store lock) all agree.
+        Worker-registration gating matches the single-run claim.
+        """
+        tenant = normalize_tenant(tenant)
+        worker_id = normalize_worker_id(worker_id)
+        lease = normalize_worker_lease(lease_seconds)
+        now = self.now()
+        with self.store.locked():
+            self._check_worker_registration(tenant, worker_id, now)
+            runs = self.store.load_all_runs(tenant)
+            # Activate due sleeping runs in run_id order; already-activated
+            # runs are left untouched.
+            for run in runs:
+                not_before = run.get("not_before")
+                if not_before is None or float(not_before) > now:
+                    continue
+                if _roots_opened(run):
+                    continue
+                self._open_root_nodes(run)
+                run["status"] = _derive_run_status(run)
+                run["updated_at"] = self._iso()
+                self.store.save_run(run)
+            # Pick the fairest eligible run.
+            best_key, best_run, best_previous = None, None, None
+            for run in runs:
+                if run["status"] in TERMINAL_RUN_STATES:
+                    continue
+                not_before = run.get("not_before")
+                if not_before is not None and float(not_before) > now:
+                    continue
+                previous = run["status"]
+                reclaimed = self._expire_leases(run, now)
+                if reclaimed:
+                    run["status"] = _derive_run_status(run)
+                    run["updated_at"] = self._iso()
+                    self.store.save_run(run)
+                ready = [s for s in run["steps"].values() if s["status"] == STEP_READY]
+                if not ready:
+                    continue
+                quota = run.get("max_parallelism")
+                if quota is not None and _active_lease_count(run, now) >= int(quota):
+                    continue
+                claims = sum(1 for e in run["history"] if e.get("type") == "claim")
+                key = (claims, run.get("created_at") or "", run["run_id"])
+                if best_key is None or key < best_key:
+                    best_key, best_run, best_previous = key, run, previous
+            if best_run is None:
+                return None
+            run = best_run
+            index = run["order_index"]
+            step = min((s for s in run["steps"].values() if s["status"] == STEP_READY),
+                       key=lambda s: (index.get(s["id"], 0), s["id"]))
+            step.update(status=STEP_RUNNING, worker_id=worker_id, next_attempt_at=None,
+                        lease_deadline=now + lease, started_at=self._iso())
+            self._event(run, run["run_id"], step["id"], "claim", attempt=step["attempt"],
+                        worker_id=worker_id, lease_deadline=step["lease_deadline"])
+            run["status"] = _derive_run_status(run)
+            if run["status"] == RUN_RUNNING and best_previous == RUN_PENDING:
+                self._event(run, run["run_id"], None, "run_started")
+            run["updated_at"] = self._iso()
+            self.store.save_run(run)
+            return run["run_id"], dict(step)
 
     def heartbeat(self, tenant, run_id, step_id, worker_id, lease_seconds=30):
         """Renew the lease on a running step held by ``worker_id``.

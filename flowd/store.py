@@ -172,6 +172,17 @@ class WorkflowStore:
                 return tenant
         return None
 
+    def load_all_runs(self, tenant):
+        """Return every run of the tenant as a list sorted by ``run_id``."""
+        runs_dir = os.path.join(self.tenant_dir(tenant), "runs")
+        items = []
+        for name in sorted(os.listdir(runs_dir)) if os.path.isdir(runs_dir) else []:
+            run = read_json(os.path.join(runs_dir, name), None) if name.endswith(".json") else None
+            if run is not None:
+                items.append(normalize_run(run))
+        items.sort(key=lambda r: r.get("run_id", ""))
+        return items
+
     def list_runs(self, tenant, status=None, limit=50, after=None):
         runs_dir = os.path.join(self.tenant_dir(tenant), "runs")
         items = []
