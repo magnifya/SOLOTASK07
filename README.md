@@ -47,7 +47,7 @@ the only accepted values are `task` and `approval`.
 | --- | --- | --- | --- |
 | GET | `/healthz` | 200 `{"ok":true}` | - |
 | POST | `/v1/workflows` | 201 validated plan | 400 validation error, 400 bad JSON |
-| POST | `/v1/runs` | 201 run (new or replayed) | 400 bad request/max_parallelism/idempotency_key/params, 404 unknown workflow, 409 idempotency conflict |
+| POST | `/v1/runs` | 201 run (new or replayed) | 400 bad request/max_parallelism/idempotency_key/params/not_before, 404 unknown workflow, 409 idempotency conflict |
 | GET | `/v1/runs/{run_id}?tenant=` | 200 run with step states | 400 missing tenant, 403 cross-tenant, 404 unknown run |
 | POST | `/v1/runs/{run_id}/claim` | 200 `{"step":...}`, 204 nothing ready | 400 bad request, 403 cross-tenant, 404 unknown run |
 | POST | `/v1/runs/{run_id}/complete` | 200 updated run | 400 bad request, 403, 404 unknown step, 409 lease not held/expired |
@@ -81,6 +81,42 @@ JSON: ready tasks stay ready and no claim history is appended (takeover
 entries from leases reclaimed by the same call are still recorded). Quotas
 are counted per `run_id`, so runs and tenants never share slots.
 
+### Delayed start (`not_before`)
+
+`POST /v1/runs` (and `Scheduler.start_run`) accept an optional `not_before`:
+a UTC Unix timestamp in seconds. Omit it or pass `null` to open the root
+nodes immediately (the legacy behavior). Any other value must be a finite,
+non-negative integer or float; booleans, strings, negative numbers and
+non-finite numbers (`NaN`, `Infinity`) are rejected with 400
+(`bad_not_before`) and create no run.
+
+A value at or before the current time behaves exactly like an immediate
+start. A strictly future value creates a **sleeping** run: the run and every
+node stay `pending` with `attempt` 0, no root task becomes `ready`, no root
+approval becomes `waiting`, no history beyond `run_created` is appended, and
+no quota slot is occupied. The run still appears in detail and list
+responses, carrying its `not_before`.
+
+`claim` is the only activation entry point. A claim while
+`now < not_before` returns `None` (HTTP 204, the CLI keeps its
+`step: null` output) and changes nothing: state, history and `updated_at`
+are untouched. The first claim with `now >= not_before` opens the root
+nodes — root tasks become `ready`, root approvals `waiting`, one history
+event each — and then leases at most one task in the usual topological
+order and under the quota. A run whose roots are all approvals activates on
+that claim and still returns no task (204). Repeated claims never re-open a
+node. Run detail/listing, idempotent re-creation and replay do not
+activate, even once the time is due; an approval decision attempted before
+activation returns 409 (`not_waiting`). After activation, completion,
+retries, takeover, heartbeat and approval behavior are unchanged.
+
+The scheduled time is part of the run document and survives a restart:
+`Scheduler.replay` rebuilds the same run status, node states and
+`not_before` whether the run was still sleeping or already activated. The
+value is reported as `not_before` on the create response, run details, the
+run listing and `flowd status`; runs written by older versions read it
+back as `null`.
+
 ### Tenant-scoped idempotency keys
 
 `POST /v1/runs` (and `Scheduler.start_run`) accept an optional
@@ -103,14 +139,18 @@ When a key is present, `params` must be a JSON object (omit or `null` means
 `{}`; arrays, strings, numbers and booleans return 400 `bad_params`). A repeat
 matches the first creation semantically: object key order is ignored, array
 order is significant, booleans are distinct from numbers (`true != 1`), and
-ints/floats compare by numeric value (`1 == 1.0`). `workflow_id`, `params` and
-`max_parallelism` must all equal the first request — omitting `run_id` reuses
-the bound run, while an explicit `run_id` must equal it; omitted or `null`
-quotas mean unlimited and differ from any numeric quota.
+ints/floats compare by numeric value (`1 == 1.0`). `workflow_id`, `params`,
+`max_parallelism` and `not_before` must all equal the first request —
+omitting `run_id` reuses the bound run, while an explicit `run_id` must
+equal it; omitted or `null` quotas mean unlimited and differ from any
+numeric quota; omitting `not_before` is equivalent to `null` and distinct
+from an explicit timestamp, while int and float timestamps compare by
+numeric value.
 
 Validation order is fixed: an illegal key, `params` or quota returns 400 first
-(`bad_idempotency_key`, then `bad_max_parallelism`, then `bad_params`); a legal
-request that differs from the first creation returns 409
+(`bad_idempotency_key`, then `bad_max_parallelism`, then `bad_params`), then
+an illegal `not_before` returns 400 (`bad_not_before`); a legal request that
+differs from the first creation returns 409
 (`idempotency_conflict`); only a brand-new key pointing at an unknown workflow
 returns 404 (`unknown_workflow`). Rejections create no run and never alter the
 bound one. Matching always uses the first creation's stored content, so
@@ -153,6 +193,8 @@ Step states: `pending` -> `ready` -> `running` -> `succeeded` | `failed`;
 approval steps instead go `pending` -> `waiting` -> `succeeded` | `failed`.
 
 - A step starts `pending` and becomes `ready` only when **all** dependencies are `succeeded`.
+  Root steps open immediately at run creation unless the run has a future `not_before`, in
+  which case they open on the first due `claim` (see [Delayed start](#delayed-start-not_before)).
 - An `approval` step becomes `waiting` under the same condition (immediately at
   run creation when it has no dependencies); waiting blocks only its successors.
 - `claim` (worker lease) moves a `ready` task to `running` and sets `lease_deadline`;

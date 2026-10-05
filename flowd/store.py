@@ -164,10 +164,12 @@ def normalize_run(run):
     Runs without ``max_parallelism`` predate per-run concurrency quotas and
     have no limit (``None``).  Runs without ``idempotency_key`` predate
     tenant-scoped idempotency keys and never participate in dedup (``None``).
-    Mutates and returns ``run``.
+    Runs without ``not_before`` predate delayed start and begin immediately
+    (``None``).  Mutates and returns ``run``.
     """
     run.setdefault("max_parallelism", None)
     run.setdefault("idempotency_key", None)
+    run.setdefault("not_before", None)
     for step in run.get("steps", {}).values():
         step.setdefault("kind", KIND_TASK)
         step.setdefault("approval", None)
@@ -175,7 +177,7 @@ def normalize_run(run):
 
 
 def new_run(tenant, workflow_id, run_id, params, plan, now_iso, max_parallelism=None,
-            idempotency_key=None):
+            idempotency_key=None, not_before=None):
     """Build a fresh run document from a validated plan."""
     steps = {
         step["id"]: {
@@ -205,6 +207,7 @@ def new_run(tenant, workflow_id, run_id, params, plan, now_iso, max_parallelism=
         "params": params or {},
         "max_parallelism": max_parallelism,
         "idempotency_key": idempotency_key,
+        "not_before": not_before,
         "created_at": now_iso,
         "updated_at": now_iso,
         "step_order": list(plan["order"]),
