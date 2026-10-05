@@ -659,6 +659,63 @@ class Scheduler:
         return reclaimed
 
     # -- claim / complete / fail ---------------------------------------
+    @staticmethod
+    def _require_claim_worker(worker_id):
+        """Validate the legacy claim worker id; the raw value is stored.
+
+        Single-run claims historically kept the caller's string verbatim on
+        the lease/history (only the registry lookup trims it), so the raw
+        value is returned.
+        """
+        if not isinstance(worker_id, str) or not worker_id.strip():
+            raise WorkflowError("worker_id must be a non-empty string", "bad_worker")
+        return worker_id
+
+    @staticmethod
+    def _require_claim_lease(lease_seconds):
+        """Legacy single-run claim lease check (positive number, bools rejected).
+
+        Deliberately keeps the historical predicate, which also admitted
+        non-finite floats; the tenant-scoped fair claim validates strictly.
+        """
+        if isinstance(lease_seconds, bool) or not isinstance(lease_seconds, (int, float)) \
+                or lease_seconds <= 0:
+            raise WorkflowError("lease_seconds must be a positive number", "bad_lease")
+        return float(lease_seconds)
+
+    @staticmethod
+    def _ready_choice(run, now):
+        """Pick the leasable task of ``run`` under topology order and quota.
+
+        Expired leases must already have been reclaimed and due root nodes
+        opened.  Returns the step, or ``None`` when no ordinary task is
+        ready or the run is already holding its ``max_parallelism`` quota;
+        approval-only nodes never qualify.
+        """
+        candidates = [s for s in run["steps"].values() if s["status"] == STEP_READY]
+        if not candidates:
+            return None
+        quota = run.get("max_parallelism")
+        if quota is not None and _active_lease_count(run, now) >= int(quota):
+            return None
+        index = run["order_index"]
+        return min(candidates, key=lambda s: (index.get(s["id"], 0), s["id"]))
+
+    def _lease_step(self, run, step, worker_id, lease_seconds, now):
+        """Move one ready task to running and append the usual claim events.
+
+        Mirrors the single-run claim: a ``claim`` event on the step and, on
+        the run's first lease, a ``run_started`` event.
+        """
+        previous = run["status"]
+        step.update(status=STEP_RUNNING, worker_id=worker_id, next_attempt_at=None,
+                    lease_deadline=now + float(lease_seconds), started_at=self._iso())
+        self._event(run, run["run_id"], step["id"], "claim", attempt=step["attempt"],
+                    worker_id=worker_id, lease_deadline=step["lease_deadline"])
+        run["status"] = _derive_run_status(run)
+        if run["status"] == RUN_RUNNING and previous == RUN_PENDING:
+            self._event(run, run["run_id"], None, "run_started")
+
     def claim(self, tenant, run_id, worker_id, lease_seconds=30):
         """Lease the next ready step, or return ``None`` when none is ready.
 
@@ -673,11 +730,8 @@ class Scheduler:
         active registration (``worker_not_registered`` / ``worker_expired``);
         a tenant with no registrations keeps the legacy non-empty-id rule.
         """
-        if not isinstance(worker_id, str) or not worker_id.strip():
-            raise WorkflowError("worker_id must be a non-empty string", "bad_worker")
-        if not isinstance(lease_seconds, (int, float)) or isinstance(lease_seconds, bool) \
-                or lease_seconds <= 0:
-            raise WorkflowError("lease_seconds must be a positive number", "bad_lease")
+        worker_id = self._require_claim_worker(worker_id)
+        lease_seconds = self._require_claim_lease(lease_seconds)
         now = self.now()
         with self.store.locked():
             owner = self.store.run_exists(run_id)
@@ -694,24 +748,76 @@ class Scheduler:
                 return None
             self._expire_leases(run, now)
             self._open_root_nodes(run)
-            candidates = [s for s in run["steps"].values() if s["status"] == STEP_READY]
-            index = run["order_index"]
-            quota = run.get("max_parallelism")
-            at_quota = quota is not None and _active_lease_count(run, now) >= int(quota)
-            step = (min(candidates, key=lambda s: (index.get(s["id"], 0), s["id"]))
-                    if candidates and not at_quota else None)
-            previous = run["status"]
+            step = self._ready_choice(run, now)
             if step is not None:
-                step.update(status=STEP_RUNNING, worker_id=worker_id, next_attempt_at=None,
-                            lease_deadline=now + float(lease_seconds), started_at=self._iso())
-                self._event(run, run_id, step["id"], "claim", attempt=step["attempt"],
-                            worker_id=worker_id, lease_deadline=step["lease_deadline"])
-            run["status"] = _derive_run_status(run)
-            if step is not None and run["status"] == RUN_RUNNING and previous == RUN_PENDING:
-                self._event(run, run_id, None, "run_started")
+                self._lease_step(run, step, worker_id, lease_seconds, now)
             run["updated_at"] = self._iso()
             self.store.save_run(run)
             return dict(step) if step is not None else None
+
+    def claim_next(self, tenant, worker_id, lease_seconds=30):
+        """Lease one task from the tenant's runs under fair scheduling.
+
+        The tenant's runs are scanned in ``run_id`` order: each sleeping run
+        whose ``not_before`` is due gets its one-time root activation (the
+        same activation a single-run claim performs), and expired leases are
+        reclaimed wherever encountered.  Among the runs that currently have a
+        leasable ordinary task under their ``max_parallelism`` quota, the run
+        with the fewest successful ``claim`` events in its append-only history
+        wins; ties break by ``created_at`` and then ``run_id``.  The winning
+        run then leases exactly one task in the existing topological/step-id
+        order.
+
+        Returns ``(run_id, step)`` or ``(None, None)`` when no run has a
+        leasable task.  Sleeping runs, terminal runs, runs with only approval
+        nodes waiting and runs at quota never become candidates.  Due
+        activations and lease takeovers are persisted even on a no-task call,
+        exactly as the equivalent single-run claims would leave them.
+        """
+        tenant = normalize_tenant(tenant)
+        worker_id = normalize_worker_id(worker_id)
+        lease_seconds = normalize_worker_lease(lease_seconds)
+        now = self.now()
+        with self.store.locked():
+            # Gate the whole batch against the tenant's worker registry, the
+            # same way a single-run claim is gated.
+            self._check_worker_registration(tenant, worker_id, now)
+            best = None  # ((claim_count, created_at, run_id), run, step)
+            changed = {}
+            for rid in self.store.run_ids(tenant):
+                run = self.get_run(tenant, rid)
+                not_before = run.get("not_before")
+                if not_before is not None and float(not_before) > now:
+                    # Still sleeping: never a candidate, state untouched.
+                    continue
+                if run["status"] in (RUN_SUCCEEDED, RUN_FAILED):
+                    # Terminal runs never re-enter scheduling: their leases
+                    # and any leftover ready tasks are left exactly as stored.
+                    continue
+                dirty = bool(self._expire_leases(run, now))
+                ready_ids, waiting_ids = self._open_root_nodes(run)
+                dirty = dirty or bool(ready_ids or waiting_ids)
+                if dirty:
+                    changed[rid] = run
+                step = self._ready_choice(run, now)
+                if step is None:
+                    continue
+                count = sum(1 for event in run["history"] if event.get("type") == "claim")
+                key = (count, run.get("created_at") or "", rid)
+                if best is None or key < best[0]:
+                    best = (key, run, step)
+            if best is None:
+                for run in changed.values():
+                    run["updated_at"] = self._iso()
+                    self.store.save_run(run)
+                return None, None
+            _, run, step = best
+            self._lease_step(run, step, worker_id, lease_seconds, now)
+            changed[run["run_id"]] = run
+            for persisted in changed.values():
+                persisted["updated_at"] = self._iso()
+                self.store.save_run(persisted)
+            return run["run_id"], dict(step)
 
     def heartbeat(self, tenant, run_id, step_id, worker_id, lease_seconds=30):
         """Renew the lease on a running step held by ``worker_id``.

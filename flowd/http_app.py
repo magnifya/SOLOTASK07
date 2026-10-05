@@ -1,6 +1,7 @@
 """Standard library HTTP API for flowd."""
 
 import json
+import math
 import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
@@ -113,6 +114,8 @@ class _Handler(BaseHTTPRequestHandler):
             schedule_dispatch = re.fullmatch(r"/v1/schedules/([^/]+)/dispatch", path)
             if schedule_dispatch:
                 return self._dispatch_schedule(unquote(schedule_dispatch.group(1)), self._body())
+            if path == "/v1/tasks/claim":
+                return self._claim_next_task(self._body())
             action = re.fullmatch(r"/v1/runs/([^/]+)/(claim|complete|fail|decision|heartbeat)", path)
             if action:
                 if action.group(2) == "decision":
@@ -205,6 +208,29 @@ class _Handler(BaseHTTPRequestHandler):
             run = self.scheduler.fail(tenant, run_id, body.get("step_id"), worker_id,
                                       body.get("error"))
         return self._json(200, _run_view(run))
+
+    def _claim_next_task(self, body):
+        """Tenant-scoped fair claim: ``POST /v1/tasks/claim``."""
+        tenant = body.get("tenant")
+        if not isinstance(tenant, str) or not tenant.strip():
+            raise WorkflowError("tenant must be a non-empty string", "bad_tenant")
+        tenant = tenant.strip()
+        worker_id = body.get("worker_id")
+        if not isinstance(worker_id, str) or not worker_id.strip():
+            raise WorkflowError("worker_id must be a non-empty string", "bad_worker")
+        worker_id = worker_id.strip()
+        if "lease_seconds" not in body:
+            lease_seconds = 30
+        else:
+            lease_seconds = body["lease_seconds"]
+            if isinstance(lease_seconds, bool) or not isinstance(lease_seconds, (int, float)) \
+                    or not math.isfinite(lease_seconds) or lease_seconds <= 0:
+                raise WorkflowError("lease_seconds must be a finite positive number",
+                                    "bad_lease")
+        run_id, step = self.scheduler.claim_next(tenant, worker_id, lease_seconds)
+        if run_id is None:
+            return self._send(204)
+        return self._json(200, {"run_id": run_id, "step": _step_view(step)})
 
     def _heartbeat(self, run_id, body):
         """Renew a lease; strict field validation, anything bad is a 400."""

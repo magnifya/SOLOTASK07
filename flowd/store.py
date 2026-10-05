@@ -172,6 +172,18 @@ class WorkflowStore:
                 return tenant
         return None
 
+    def run_ids(self, tenant):
+        """Return the tenant's run ids sorted lexicographically.
+
+        A cheap enumeration that never deserializes the run documents.
+        """
+        runs_dir = os.path.join(self.tenant_dir(tenant), "runs")
+        if not os.path.isdir(runs_dir):
+            return []
+        return sorted(name[:-len(".json")] for name in os.listdir(runs_dir)
+                      if name.endswith(".json")
+                      and os.path.isfile(os.path.join(runs_dir, name)))
+
     def list_runs(self, tenant, status=None, limit=50, after=None):
         runs_dir = os.path.join(self.tenant_dir(tenant), "runs")
         items = []

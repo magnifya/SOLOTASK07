@@ -52,6 +52,7 @@ the only accepted values are `task` and `approval`.
 | POST | `/v1/runs` | 201 run (new or replayed) | 400 bad request/max_parallelism/idempotency_key/params/not_before, 404 unknown workflow, 409 idempotency conflict |
 | GET | `/v1/runs/{run_id}?tenant=` | 200 run with step states | 400 missing tenant, 403 cross-tenant, 404 unknown run |
 | POST | `/v1/runs/{run_id}/claim` | 200 `{"step":...}`, 204 nothing ready | 400 bad request, 403 cross-tenant, 404 unknown run, 409 worker not registered/expired |
+| POST | `/v1/tasks/claim` | 200 `{"run_id":...,"step":...}`, 204 no candidate | 400 bad_json/bad_tenant/bad_worker/bad_lease, 409 worker_not_registered/worker_expired |
 | POST | `/v1/runs/{run_id}/complete` | 200 updated run | 400 bad request, 403, 404 unknown step, 409 lease not held/expired |
 | POST | `/v1/runs/{run_id}/fail` | 200 updated run | 400 bad request, 403, 404 unknown step, 409 lease not held/expired |
 | POST | `/v1/runs/{run_id}/decision` | 200 updated run | 400 bad request/JSON, 403 cross-tenant, 404 unknown run/step, 409 not an approval/not waiting/already decided |
@@ -88,6 +89,55 @@ takes or releases a slot. When the quota is full, `Scheduler.claim` returns
 JSON: ready tasks stay ready and no claim history is appended (takeover
 entries from leases reclaimed by the same call are still recorded). Quotas
 are counted per `run_id`, so runs and tenants never share slots.
+
+### Tenant-scoped fair claim
+
+`POST /v1/tasks/claim` (`Scheduler.claim_next(tenant, worker_id,
+lease_seconds=30)`) leases one task across **all** of a tenant's runs,
+fairly. The body is `{"tenant","worker_id","lease_seconds"?}`: `tenant`
+and `worker_id` must be strings that are non-empty after trimming
+(trimmed values are what is used); `lease_seconds` may be omitted and
+defaults to 30, and when present must be a finite number strictly greater
+than zero (booleans, strings, `null`, zero, negatives, `NaN`, infinities
+and overflow magnitudes return 400 `bad_lease`). Malformed JSON or a
+non-object body returns 400 `bad_json`; a blank/missing/non-string tenant
+returns 400 `bad_tenant` and worker `bad_worker`. The single-run
+`POST /v1/runs/{run_id}/claim` request format, responses and fields are
+unchanged.
+
+A call scans the tenant's runs in `run_id` order while holding the store
+lock, so concurrent callers are fully serialized and can never lease the
+same step:
+
+- Each **sleeping** run (`not_before` in the future) is skipped with its
+  state untouched. The first scan at or after its start time performs the
+  same one-time root activation as a due single-run claim (root tasks
+  become `ready`, root approvals `waiting`, one history event each),
+  before candidates are chosen.
+- Expired leases on every non-sleeping run are reclaimed with the usual
+  `takeover` history entries during the scan, whether or not that run
+  ultimately wins.
+- **Terminal** runs (`succeeded`/`failed`, even ones that still show a
+  ready sibling of a failed step), runs that are still sleeping, runs
+  whose only open nodes are `waiting` approvals, and runs already holding
+  their `max_parallelism` quota are never candidates.
+- Among the remaining runs the run with the **fewest successful `claim`
+  events** in its append-only history is selected; ties break by
+  `created_at` and then `run_id`. The count is reconstructed from history
+  on every call, so a process restart and `Scheduler.replay` arrive at the
+  same choice, and single-run claims count identically.
+- The winning run leases exactly one task in the existing
+  `(topological index, step id)` order, writing the ordinary `claim`
+  event, a `run_started` event on its first lease, and applying the same
+  worker-registration gate (`worker_not_registered` / `worker_expired`
+  409) as single-run claims. One call leases at most one task.
+
+Success is **200** with `{"run_id": ..., "step": ...}` where `step` is the
+same object returned by the single-run claim. With no candidate the
+response is **204** and no `claim` event is appended (due activations and
+lease takeovers from that same scan are still recorded, matching the
+equivalent single-run claims). Tenant isolation is unchanged: only runs
+owned by the request tenant are scanned.
 
 ### Delayed start (`not_before`)
 
