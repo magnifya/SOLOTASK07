@@ -85,6 +85,36 @@ def normalize_params(value):
     return value
 
 
+def normalize_not_before(value):
+    """Validate an optional delayed-start time as UTC Unix seconds.
+
+    ``None`` means the run opens its root nodes immediately.  Otherwise the
+    value must be a finite non-negative int or float (booleans are rejected);
+    it is stored as a float.  A time at or before the current moment keeps
+    its stored value but behaves as an immediate start.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)) \
+            or not math.isfinite(float(value)) or value < 0:
+        raise WorkflowError(
+            "not_before must be a finite non-negative number of Unix seconds"
+            " or null", "bad_not_before")
+    return float(value)
+
+
+def _is_delayed(run, now):
+    """True while a run has not reached its (future) scheduled start time."""
+    return run.get("not_before") is not None and float(run["not_before"]) > now
+
+
+def _not_before_equal(left, right):
+    """Numeric equality for scheduled starts; an explicit time never matches null."""
+    if left is None or right is None:
+        return left is None and right is None
+    return float(left) == float(right)
+
+
 def params_equal(left, right):
     """Semantic JSON equality for run params.
 
@@ -189,25 +219,27 @@ class Scheduler:
         return self.store.save_workflow(tenant, workflow_id, steps)
 
     def start_run(self, tenant, workflow_id, run_id=None, params=None, max_parallelism=None,
-                  idempotency_key=None):
+                  idempotency_key=None, not_before=None):
         key = normalize_idempotency_key(idempotency_key)
         max_parallelism = normalize_max_parallelism(max_parallelism)
         if key is not None:
             params = normalize_params(params)
+        not_before = normalize_not_before(not_before)
         with self.store.locked():
             if key is not None:
                 return self._start_idempotent_run(
-                    tenant, workflow_id, run_id, params, max_parallelism, key
+                    tenant, workflow_id, run_id, params, max_parallelism, key, not_before
                 )
             plan = self.store.get_workflow(tenant, workflow_id)
             run_id = run_id or self.store.generate_run_id()
             if self.store.run_exists(run_id) == tenant:
                 raise WorkflowError("run already exists: %s" % run_id, "duplicate_run")
             run = new_run(tenant, workflow_id, run_id, params, plan, self._iso(),
-                          max_parallelism=max_parallelism)
+                          max_parallelism=max_parallelism, not_before=not_before)
             return self._create_run(run, plan)
 
-    def _start_idempotent_run(self, tenant, workflow_id, run_id, params, max_parallelism, key):
+    def _start_idempotent_run(self, tenant, workflow_id, run_id, params, max_parallelism, key,
+                              not_before):
         """Create once per (tenant, trimmed key); replay identical requests.
 
         Runs inside the store lock so concurrent identical requests share one
@@ -225,33 +257,42 @@ class Scheduler:
                 )
             if existing["workflow_id"] != workflow_id \
                     or not params_equal(existing.get("params") or {}, params) \
-                    or existing.get("max_parallelism") != max_parallelism:
+                    or existing.get("max_parallelism") != max_parallelism \
+                    or not _not_before_equal(not_before, existing.get("not_before")):
                 raise ConflictError(
                     "request differs from the run first created with idempotency_key %s" % key,
                     "idempotency_conflict",
                 )
-            # A repeat changes nothing: no history, no updated_at, no lease.
+            # A repeat changes nothing: it never activates a due run, and adds
+            # no history, no updated_at, no lease.
             return existing
         plan = self.store.get_workflow(tenant, workflow_id)
         run_id = run_id or self.store.generate_run_id()
         if self.store.run_exists(run_id) == tenant:
             raise WorkflowError("run already exists: %s" % run_id, "duplicate_run")
         run = new_run(tenant, workflow_id, run_id, params, plan, self._iso(),
-                      max_parallelism=max_parallelism, idempotency_key=key)
+                      max_parallelism=max_parallelism, idempotency_key=key,
+                      not_before=not_before)
         self._create_run(run, plan)
         index[key] = {"run_id": run_id}
         self.store.save_idempotency(tenant, index)
         return run
 
     def _create_run(self, run, plan):
-        """Append creation events and persist a freshly built run."""
+        """Append creation events and persist a freshly built run.
+
+        A run whose ``not_before`` is still in the future stays fully
+        ``pending``: only the creation event is recorded and no root nodes or
+        approvals are opened.  The first due :meth:`claim` activates it.
+        """
         run_id = run["run_id"]
         self._event(run, run_id, None, "run_created")
-        ready, waiting = _promote_pending(run, self._iso())
-        for sid in ready:
-            self._event(run, run_id, sid, "ready", attempt=0)
-        for sid in waiting:
-            self._event(run, run_id, sid, "waiting", attempt=0)
+        if not _is_delayed(run, self.now()):
+            ready, waiting = _promote_pending(run, self._iso())
+            for sid in ready:
+                self._event(run, run_id, sid, "ready", attempt=0)
+            for sid in waiting:
+                self._event(run, run_id, sid, "waiting", attempt=0)
         run["status"], run["updated_at"] = _derive_run_status(run), self._iso()
         return self.store.save_run(run)
 
@@ -298,6 +339,10 @@ class Scheduler:
         now = self.now()
         with self.store.locked():
             run = self.get_run(tenant, run_id)
+            if _is_delayed(run, now):
+                # claim is the only activation entry point: before not_before
+                # it changes nothing -- no state, history or updated_at.
+                return None
             self._expire_leases(run, now)
             ready, waiting = _promote_pending(run, self._iso())
             for sid in ready:
@@ -512,7 +557,8 @@ class Scheduler:
         rebuilt = new_run(tenant, stored["workflow_id"], run_id, stored.get("params"), plan,
                           stored["created_at"],
                           max_parallelism=stored.get("max_parallelism"),
-                          idempotency_key=stored.get("idempotency_key"))
+                          idempotency_key=stored.get("idempotency_key"),
+                          not_before=stored.get("not_before"))
         steps = rebuilt["steps"]
         for event in stored["history"]:
             sid, etype, at = event.get("step_id"), event.get("type"), event.get("at")

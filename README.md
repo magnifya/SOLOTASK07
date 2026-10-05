@@ -47,7 +47,7 @@ the only accepted values are `task` and `approval`.
 | --- | --- | --- | --- |
 | GET | `/healthz` | 200 `{"ok":true}` | - |
 | POST | `/v1/workflows` | 201 validated plan | 400 validation error, 400 bad JSON |
-| POST | `/v1/runs` | 201 run (new or replayed) | 400 bad request/max_parallelism/idempotency_key/params, 404 unknown workflow, 409 idempotency conflict |
+| POST | `/v1/runs` | 201 run (new or replayed) | 400 bad request/max_parallelism/idempotency_key/params/not_before, 404 unknown workflow, 409 idempotency conflict |
 | GET | `/v1/runs/{run_id}?tenant=` | 200 run with step states | 400 missing tenant, 403 cross-tenant, 404 unknown run |
 | POST | `/v1/runs/{run_id}/claim` | 200 `{"step":...}`, 204 nothing ready | 400 bad request, 403 cross-tenant, 404 unknown run |
 | POST | `/v1/runs/{run_id}/complete` | 200 updated run | 400 bad request, 403, 404 unknown step, 409 lease not held/expired |
@@ -126,6 +126,49 @@ the listing, `flowd status` and `Scheduler.replay`. Runs written by older
 versions read back as `null` and never participate in dedup; unkeyed creates
 keep their existing semantics.
 
+### Delayed starts (`not_before`)
+
+`POST /v1/runs` (and `Scheduler.start_run`) accept an optional `not_before`:
+a UTC Unix timestamp in seconds. Omit it or pass `null` to open the run's
+root nodes immediately, as before. Any other value must be a finite
+non-negative integer or float; booleans, strings, arrays, objects, negative
+and non-finite numbers return 400 (`bad_not_before`) and create no run. The
+value is validated before the workflow is looked up or an idempotency binding
+is matched, and the existing field-to-field validation order is otherwise
+unchanged.
+
+A timestamp at or before the current moment behaves exactly like an immediate
+start. A timestamp in the future leaves the run and every node `pending`
+(attempt `0`): no root tasks become `ready`, no root approvals become
+`waiting`, no approval can be decided (409), and no quota slot is held; the
+history contains only `run_created`.
+
+`claim` is the single activation entry point. Before `not_before`,
+`Scheduler.claim` returns `None`, HTTP claim returns **204** and the CLI
+prints its existing `step: null` JSON, and the run's state, history and
+`updated_at` are untouched — so reads, listings and idempotent re-creates
+never activate a run, even once the time has passed. When the current time is
+at or past `not_before`, the first claim opens the roots (root tasks become
+`ready`, root approvals `waiting`, recording one `ready`/`waiting` history
+entry per root) and then follows the existing ordering and quota rules to
+lease at most one task. A run containing only approval nodes activates on that
+first due claim and returns no task (204); repeated claims never re-open a
+node. Completion, retry, takeover, heartbeat and approval behavior after
+activation are unchanged.
+
+The scheduled time is included as `not_before` on the create response, run
+details, the listing and `flowd status`; runs written before this feature
+read back as `null`. It survives restarts: `Scheduler.replay` rebuilds the
+same run state, node states and `not_before` whether a run is still waiting,
+has just activated or has already progressed.
+
+For keyed creates, `not_before` is part of the first-creation signature:
+omitted and `null` are equivalent, integers and floats compare by numeric
+value (`1700000060 == 1700000060.0`), and an explicit time never matches
+`null`. A repeat with the same time returns the original run without
+resetting state or activating it; a different time returns 409
+(`idempotency_conflict`) and leaves the original run unchanged.
+
 ### Approval decisions
 
 `POST /v1/runs/{run_id}/decision` takes `{"tenant","step_id","actor","decision"}`.
@@ -155,6 +198,8 @@ approval steps instead go `pending` -> `waiting` -> `succeeded` | `failed`.
 - A step starts `pending` and becomes `ready` only when **all** dependencies are `succeeded`.
 - An `approval` step becomes `waiting` under the same condition (immediately at
   run creation when it has no dependencies); waiting blocks only its successors.
+  For a run created with a future `not_before`, neither happens until the first
+  `claim` at or past that time activates it (see "Delayed starts").
 - `claim` (worker lease) moves a `ready` task to `running` and sets `lease_deadline`;
   waiting approvals are never claimed.
 - `complete` moves `running` -> `succeeded` and is idempotent for the same worker.
