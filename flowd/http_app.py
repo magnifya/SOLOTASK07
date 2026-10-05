@@ -10,7 +10,8 @@ from .scheduler import ConflictError, LeaseError
 
 MAX_BODY = 1 << 20
 STATUS_FOR_CODE = {"unknown_run": 404, "unknown_workflow": 404, "unknown_step": 404,
-                   "unknown_worker": 404, "cross_tenant": 403}
+                   "unknown_worker": 404, "unknown_schedule": 404, "cross_tenant": 403,
+                   "schedule_exists": 409}
 DECISIONS = ("approve", "reject")
 
 
@@ -86,6 +87,8 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._list_runs(query)
             if path == "/v1/workers":
                 return self._list_workers(query)
+            if path == "/v1/schedules":
+                return self._list_schedules(query)
         elif method == "POST":
             if path == "/v1/workers/register":
                 return self._register_worker(self._body())
@@ -105,6 +108,19 @@ class _Handler(BaseHTTPRequestHandler):
                                                body.get("idempotency_key"),
                                                body.get("not_before"))
                 return self._json(201, _run_view(run))
+            if path == "/v1/schedules":
+                body = self._body()
+                record = self.scheduler.create_schedule(
+                    self._tenant({}, body), body.get("schedule_id"), body.get("workflow_id"),
+                    body.get("interval_seconds"), body.get("first_at"), body.get("params"),
+                    body.get("max_parallelism"))
+                return self._json(201, _schedule_view(record))
+            dispatch = re.fullmatch(r"/v1/schedules/([^/]+)/dispatch", path)
+            if dispatch:
+                body = self._body()
+                run = self.scheduler.dispatch_schedule(self._tenant({}, body),
+                                                       unquote(dispatch.group(1)))
+                return self._send(204) if run is None else self._json(201, _run_view(run))
             action = re.fullmatch(r"/v1/runs/([^/]+)/(claim|complete|fail|decision|heartbeat)", path)
             if action:
                 if action.group(2) == "decision":
@@ -163,6 +179,12 @@ class _Handler(BaseHTTPRequestHandler):
         return self._json(200, {"tenant": tenant,
                                 "items": self.scheduler.list_workers(tenant)})
 
+    def _list_schedules(self, query):
+        tenant = self._tenant(query)
+        return self._json(200, {"tenant": tenant,
+                                "items": [_schedule_view(r)
+                                          for r in self.scheduler.list_schedules(tenant)]})
+
     def _step_action(self, run_id, action, body):
         tenant, worker_id = self._tenant({}, body), body.get("worker_id")
         if action == "claim":
@@ -215,12 +237,24 @@ def _step_view(step):
             "error": step.get("error"), "approval": step.get("approval")}
 
 
+def _schedule_view(record):
+    return {"tenant": record["tenant"], "schedule_id": record["schedule_id"],
+            "workflow_id": record["workflow_id"],
+            "interval_seconds": record["interval_seconds"],
+            "first_at": record.get("first_at"), "next_at": record.get("next_at"),
+            "params": record.get("params") or {},
+            "max_parallelism": record.get("max_parallelism"),
+            "created_at": record.get("created_at"), "updated_at": record.get("updated_at")}
+
+
 def _run_view(run):
     return {"tenant": run["tenant"], "run_id": run["run_id"], "workflow_id": run["workflow_id"],
             "status": run["status"], "params": run.get("params") or {},
             "max_parallelism": run.get("max_parallelism"),
             "idempotency_key": run.get("idempotency_key"),
             "not_before": run.get("not_before"),
+            "schedule_id": run.get("schedule_id"),
+            "scheduled_at": run.get("scheduled_at"),
             "created_at": run.get("created_at"), "updated_at": run.get("updated_at"),
             "steps": [_step_view(run["steps"][sid]) for sid in run["step_order"]],
             "history_length": len(run.get("history") or [])}

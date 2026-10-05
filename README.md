@@ -9,7 +9,8 @@ access, no third-party imports.
 
 Data lives in a single directory: `<root>/<tenant>/workflows.json`,
 `<root>/<tenant>/idempotency.json` (idempotency-key → run bindings),
-`<root>/<tenant>/workers.json` (worker registrations) plus
+`<root>/<tenant>/workers.json` (worker registrations),
+`<root>/<tenant>/schedules.json` (interval schedules) plus
 `<root>/<tenant>/runs/<run_id>.json`, written atomically, so restarting the
 process sees exactly the same state.
 
@@ -59,6 +60,9 @@ the only accepted values are `task` and `approval`.
 | POST | `/v1/workers/{worker_id}/heartbeat` | 200 registration record | 400 bad tenant/lease_seconds/JSON, 404 unknown worker, 409 worker_expired |
 | GET | `/v1/workers?tenant=` | 200 `{"tenant":...,"items":[...]}` sorted by worker_id | 400 missing tenant |
 | GET | `/v1/runs?tenant=&status=&limit=&after=` | 200 `{"items":[...],"next_after":...}` | 400 missing tenant |
+| POST | `/v1/schedules` | 201 schedule record with `next_at` | 400 bad tenant/schedule_id/interval/first_at/params/max_parallelism, 404 unknown workflow, 409 schedule exists |
+| GET | `/v1/schedules?tenant=` | 200 `{"tenant":...,"items":[...]}` sorted by schedule_id | 400 missing tenant |
+| POST | `/v1/schedules/{schedule_id}/dispatch` | 201 created run, 204 nothing due | 400 missing tenant, 403 cross-tenant, 404 unknown schedule |
 
 Errors are always `{"error": "<message>"}`.
 
@@ -169,6 +173,40 @@ The key is reported as `idempotency_key` on the create response, run details,
 the listing, `flowd status` and `Scheduler.replay`. Runs written by older
 versions read back as `null` and never participate in dedup; unkeyed creates
 keep their existing semantics.
+
+### Interval schedules
+
+`POST /v1/schedules` registers a persistent schedule that produces a run of
+one workflow every `interval_seconds`. The body takes `tenant`,
+`schedule_id`, `workflow_id`, `interval_seconds` and optional `first_at`,
+`params` and `max_parallelism`; all times are UTC Unix seconds. `schedule_id`
+is trimmed and must be non-empty (`bad_schedule_id`), `interval_seconds`
+must be a finite number strictly greater than zero (`bad_interval`),
+`first_at` must be a finite non-negative number (`bad_first_at`; omitted or
+`null` means the creation moment), `params` must be a JSON object
+(`bad_params`) and `max_parallelism` follows the run-level rules
+(`bad_max_parallelism`). A missing tenant returns `bad_tenant`, an unknown
+workflow 404 (`unknown_workflow`) and a duplicate `schedule_id` in the same
+tenant 409 (`schedule_exists`); ids are scoped per tenant. The created
+record carries `next_at` (initially the first trigger time) and is
+returned with 201; `GET /v1/schedules?tenant=` lists a tenant's schedules
+sorted by `schedule_id`.
+
+`POST /v1/schedules/{schedule_id}/dispatch` with `{"tenant": ...}` fires the
+schedule manually. An unknown id returns 404 (`unknown_schedule`); an id
+owned by another tenant returns 403 (`cross_tenant`). While the current
+time is strictly earlier than `next_at` the call returns **204** and
+changes nothing. When due, exactly one run is created for the current
+`next_at` — stamped with `schedule_id` and `scheduled_at` (the trigger
+time) and inheriting the schedule's `params` and `max_parallelism` — and
+`next_at` advances by one interval; creation and advancement happen under
+the store lock, so a repeat dispatch before the next slot returns 204 and
+never duplicates a run. If several trigger points were missed, each
+dispatch catches up exactly one of them, in time order. Schedules and
+their `next_at` live in `<tenant>/schedules.json` and survive a restart
+over the same data directory; dispatched runs are ordinary runs — claim,
+approval, retry, lease, idempotency and replay behavior is unchanged — and
+`POST /v1/runs` still creates only a single run.
 
 ### Approval decisions
 

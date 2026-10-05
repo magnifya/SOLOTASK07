@@ -5,6 +5,7 @@ Layout::
     <root>/<tenant>/workflows.json
     <root>/<tenant>/idempotency.json
     <root>/<tenant>/workers.json
+    <root>/<tenant>/schedules.json
     <root>/<tenant>/runs/<run_id>.json
 
 Every write is atomic (temp file + ``os.replace``) so a crash cannot leave a
@@ -92,6 +93,9 @@ class WorkflowStore:
     def workers_path(self, tenant):
         return os.path.join(self.tenant_dir(tenant), "workers.json")
 
+    def schedules_path(self, tenant):
+        return os.path.join(self.tenant_dir(tenant), "schedules.json")
+
     def run_path(self, tenant, run_id):
         return os.path.join(self.tenant_dir(tenant), "runs", "%s.json" % run_id)
 
@@ -133,6 +137,24 @@ class WorkflowStore:
     def save_workers(self, tenant, index):
         atomic_write_json(self.workers_path(tenant), index)
         return index
+
+    # -- schedules ------------------------------------------------------
+    def load_schedules(self, tenant):
+        """Return the tenant's ``{schedule_id: schedule record}`` map."""
+        return read_json(self.schedules_path(tenant), {}) or {}
+
+    def save_schedules(self, tenant, index):
+        atomic_write_json(self.schedules_path(tenant), index)
+        return index
+
+    def schedule_exists(self, schedule_id):
+        """Return the tenant owning ``schedule_id``, or ``None``."""
+        for tenant in sorted(os.listdir(self.root)):
+            path = os.path.join(self.root, tenant, "schedules.json")
+            data = read_json(path, None) if os.path.isfile(path) else None
+            if data and schedule_id in data:
+                return tenant
+        return None
 
     # -- runs ----------------------------------------------------------
     def save_run(self, run):
@@ -178,11 +200,15 @@ def normalize_run(run):
     have no limit (``None``).  Runs without ``idempotency_key`` predate
     tenant-scoped idempotency keys and never participate in dedup (``None``).
     Runs without ``not_before`` predate delayed start and begin immediately
-    (``None``).  Mutates and returns ``run``.
+    (``None``).  Runs without ``schedule_id``/``scheduled_at`` predate
+    interval schedules and were created directly (``None``).  Mutates and
+    returns ``run``.
     """
     run.setdefault("max_parallelism", None)
     run.setdefault("idempotency_key", None)
     run.setdefault("not_before", None)
+    run.setdefault("schedule_id", None)
+    run.setdefault("scheduled_at", None)
     for step in run.get("steps", {}).values():
         step.setdefault("kind", KIND_TASK)
         step.setdefault("approval", None)
@@ -221,6 +247,8 @@ def new_run(tenant, workflow_id, run_id, params, plan, now_iso, max_parallelism=
         "max_parallelism": max_parallelism,
         "idempotency_key": idempotency_key,
         "not_before": not_before,
+        "schedule_id": None,
+        "scheduled_at": None,
         "created_at": now_iso,
         "updated_at": now_iso,
         "step_order": list(plan["order"]),

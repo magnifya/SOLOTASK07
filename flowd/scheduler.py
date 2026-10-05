@@ -130,6 +130,59 @@ def normalize_params(value):
     return value
 
 
+def normalize_schedule_id(value):
+    """Validate a schedule id: a string that is non-empty after trimming."""
+    if not isinstance(value, str):
+        raise WorkflowError("schedule_id must be a string", "bad_schedule_id")
+    schedule_id = value.strip()
+    if not schedule_id:
+        raise WorkflowError("schedule_id must be a non-empty string", "bad_schedule_id")
+    return schedule_id
+
+
+def normalize_interval(value):
+    """Validate a schedule interval in seconds.
+
+    The value must be a finite number strictly greater than zero; booleans,
+    strings, NaN and infinities are rejected.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise WorkflowError("interval_seconds must be a finite positive number", "bad_interval")
+    try:
+        seconds = float(value)
+    except OverflowError:
+        seconds = float("inf")
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise WorkflowError("interval_seconds must be a finite positive number", "bad_interval")
+    return seconds
+
+
+def normalize_first_at(value):
+    """Validate an optional first trigger time in UTC Unix seconds.
+
+    ``None`` (omitted or explicit ``null``) means the creation moment.
+    Otherwise the value must be a finite, non-negative int or float
+    (booleans, strings, NaN and infinities are rejected).
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise WorkflowError(
+            "first_at must be a finite non-negative number of Unix seconds or null",
+            "bad_first_at",
+        )
+    try:
+        seconds = float(value)
+    except OverflowError:
+        seconds = float("inf")
+    if not math.isfinite(seconds) or seconds < 0:
+        raise WorkflowError(
+            "first_at must be a finite non-negative number of Unix seconds or null",
+            "bad_first_at",
+        )
+    return seconds
+
+
 def normalize_not_before(value):
     """Validate an optional delayed-start time in UTC Unix seconds.
 
@@ -366,6 +419,93 @@ class Scheduler:
             if tenant is None:
                 raise WorkflowError("unknown run: %s" % run_id, "unknown_run")
         return list(self.get_run(tenant, run_id)["history"])
+
+    # -- interval schedules ----------------------------------------------
+    def create_schedule(self, tenant, schedule_id, workflow_id, interval_seconds,
+                        first_at=None, params=None, max_parallelism=None):
+        """Register a persistent interval schedule for ``workflow_id``.
+
+        The schedule fires at ``first_at`` (default: the creation moment) and
+        then every ``interval_seconds``.  ``next_at`` starts at the first
+        trigger time and is advanced by one interval per dispatch.  The
+        record lives in ``<tenant>/schedules.json`` and survives a restart.
+        """
+        tenant = normalize_tenant(tenant)
+        schedule_id = normalize_schedule_id(schedule_id)
+        interval = normalize_interval(interval_seconds)
+        first_at = normalize_first_at(first_at)
+        params = normalize_params(params)
+        max_parallelism = normalize_max_parallelism(max_parallelism)
+        now = self.now()
+        with self.store.locked():
+            self.store.get_workflow(tenant, workflow_id)
+            schedules = self.store.load_schedules(tenant)
+            if schedule_id in schedules:
+                raise WorkflowError("schedule already exists: %s" % schedule_id,
+                                    "schedule_exists")
+            start = first_at if first_at is not None else now
+            record = {
+                "tenant": tenant,
+                "schedule_id": schedule_id,
+                "workflow_id": workflow_id,
+                "interval_seconds": interval,
+                "first_at": start,
+                "next_at": start,
+                "params": params,
+                "max_parallelism": max_parallelism,
+                "created_at": self._iso(now),
+                "updated_at": self._iso(now),
+            }
+            schedules[schedule_id] = record
+            self.store.save_schedules(tenant, schedules)
+            return dict(record)
+
+    def list_schedules(self, tenant):
+        """Return the tenant's schedule records sorted by schedule_id."""
+        tenant = normalize_tenant(tenant)
+        with self.store.locked():
+            schedules = self.store.load_schedules(tenant)
+            return [dict(schedules[schedule_id]) for schedule_id in sorted(schedules)]
+
+    def dispatch_schedule(self, tenant, schedule_id):
+        """Fire one due trigger of a schedule, creating its run.
+
+        Returns ``None`` while the current time is strictly earlier than
+        ``next_at`` (HTTP 204, nothing changes).  When due, exactly one run
+        is created for the current ``next_at`` — stamped with ``schedule_id``
+        and ``scheduled_at`` and inheriting the schedule's ``params`` and
+        ``max_parallelism`` — and ``next_at`` advances by one interval, all
+        under the store lock so a repeat dispatch cannot create a duplicate.
+        Missed trigger points are caught up one per call, in time order.
+        """
+        tenant = normalize_tenant(tenant)
+        schedule_id = schedule_id.strip() if isinstance(schedule_id, str) else ""
+        now = self.now()
+        with self.store.locked():
+            schedules = self.store.load_schedules(tenant)
+            record = schedules.get(schedule_id) if schedule_id else None
+            if record is None:
+                owner = self.store.schedule_exists(schedule_id)
+                if owner is not None:
+                    raise WorkflowError(
+                        "schedule %s belongs to another tenant" % schedule_id, "cross_tenant"
+                    )
+                raise WorkflowError("unknown schedule: %s" % schedule_id, "unknown_schedule")
+            next_at = float(record["next_at"])
+            if now < next_at:
+                return None
+            run = self.start_run(tenant, record["workflow_id"],
+                                 params=dict(record.get("params") or {}),
+                                 max_parallelism=record.get("max_parallelism"))
+            run["schedule_id"] = schedule_id
+            run["scheduled_at"] = next_at
+            self.store.save_run(run)
+            record = dict(record)
+            record["next_at"] = next_at + float(record["interval_seconds"])
+            record["updated_at"] = self._iso(now)
+            schedules[schedule_id] = record
+            self.store.save_schedules(tenant, schedules)
+            return run
 
     # -- worker registry -----------------------------------------------
     def _worker_view(self, record, now=None):
