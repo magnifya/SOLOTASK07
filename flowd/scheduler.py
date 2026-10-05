@@ -39,6 +39,33 @@ class ConflictError(WorkflowError):
         super().__init__(message, code)
 
 
+WORKER_ACTIVE = "active"
+WORKER_EXPIRED = "expired"
+DEFAULT_WORKER_LEASE = 30.0
+
+
+def normalize_name(value, field):
+    """Trim and require a non-empty string field (tenant or worker id)."""
+    if not isinstance(value, str):
+        raise WorkflowError("%s must be a non-empty string" % field, "bad_%s" % field)
+    trimmed = value.strip()
+    if not trimmed:
+        raise WorkflowError("%s must be a non-empty string" % field, "bad_%s" % field)
+    return trimmed
+
+
+def normalize_worker_lease(value):
+    """Validate a worker registry lease: finite positive number, default 30s."""
+    if value is None:
+        return DEFAULT_WORKER_LEASE
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise WorkflowError("lease_seconds must be a positive number", "bad_lease")
+    seconds = float(value)
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise WorkflowError("lease_seconds must be a positive number", "bad_lease")
+    return seconds
+
+
 def backoff_seconds(attempt, base=1.0):
     """Exponential backoff: ``base * 2 ** (attempt - 1)``."""
     return float(base) * (2 ** (max(1, int(attempt)) - 1))
@@ -322,6 +349,73 @@ class Scheduler:
                 raise WorkflowError("unknown run: %s" % run_id, "unknown_run")
         return list(self.get_run(tenant, run_id)["history"])
 
+    # -- worker registry -----------------------------------------------
+    def _worker_view(self, record, now):
+        """Project a stored record with its real-time status."""
+        expires_at = float(record["expires_at"])
+        view = dict(record)
+        view["status"] = WORKER_ACTIVE if now < expires_at else WORKER_EXPIRED
+        return view
+
+    def register_worker(self, tenant, worker_id, lease_seconds=None):
+        """Register a worker or refresh an existing registration.
+
+        Returns ``(created, view)`` where ``created`` selects HTTP 201 vs 200.
+        A repeat registration is treated as a heartbeat: ``expires_at`` becomes
+        the later of its current value and ``now + lease_seconds``.
+        """
+        tenant = normalize_name(tenant, "tenant")
+        worker_id = normalize_name(worker_id, "worker_id")
+        lease_seconds = normalize_worker_lease(lease_seconds)
+        now = self.now()
+        with self.store.locked():
+            registry = self.store.load_workers(tenant)
+            record = registry.get(worker_id)
+            if record is None:
+                registered_at = self._iso()
+                record = {"worker_id": worker_id, "registered_at": registered_at,
+                          "last_heartbeat": registered_at, "expires_at": now + lease_seconds}
+                registry[worker_id] = record
+                created = True
+            else:
+                record["last_heartbeat"] = self._iso()
+                record["expires_at"] = max(float(record["expires_at"]), now + lease_seconds)
+                created = False
+            self.store.save_workers(tenant, registry)
+            return created, self._worker_view(record, now)
+
+    def worker_heartbeat(self, tenant, worker_id, lease_seconds=None):
+        """Extend a registered worker's expiry to the later deadline."""
+        tenant = normalize_name(tenant, "tenant")
+        worker_id = normalize_name(worker_id, "worker_id")
+        lease_seconds = normalize_worker_lease(lease_seconds)
+        now = self.now()
+        with self.store.locked():
+            registry = self.store.load_workers(tenant)
+            record = registry.get(worker_id)
+            if record is None:
+                raise WorkflowError("unknown worker: %s" % worker_id, "unknown_worker")
+            if now >= float(record["expires_at"]):
+                raise ConflictError("worker %s registration has expired" % worker_id,
+                                    "worker_expired")
+            record["last_heartbeat"] = self._iso()
+            record["expires_at"] = max(float(record["expires_at"]), now + lease_seconds)
+            self.store.save_workers(tenant, registry)
+            return self._worker_view(record, now)
+
+    def list_workers(self, tenant):
+        """Return the tenant's worker records sorted by worker id.
+
+        Status is always computed against the current time, so an expired
+        registration reports ``expired`` without being rewritten.
+        """
+        tenant = normalize_name(tenant, "tenant")
+        now = self.now()
+        with self.store.locked():
+            registry = self.store.load_workers(tenant)
+            return [self._worker_view(registry[wid], now)
+                    for wid in sorted(registry)]
+
     # -- lease expiry --------------------------------------------------
     def _expire_leases(self, run, now):
         """Release leases past their deadline; each one records a takeover."""
@@ -356,6 +450,24 @@ class Scheduler:
             raise WorkflowError("lease_seconds must be a positive number", "bad_lease")
         now = self.now()
         with self.store.locked():
+            owner = self.store.run_exists(run_id)
+            if owner is not None and owner != tenant:
+                raise WorkflowError("run %s belongs to another tenant" % run_id, "cross_tenant")
+            # Once a tenant has any worker registration, only live workers
+            # registered to that tenant may claim.  With no registrations the
+            # legacy non-empty worker_id rule stays in force.
+            registry = self.store.load_workers(tenant)
+            if registry:
+                record = registry.get(worker_id)
+                if record is None:
+                    raise ConflictError(
+                        "worker %s is not registered for tenant %s" % (worker_id, tenant),
+                        "worker_not_registered",
+                    )
+                if now >= float(record["expires_at"]):
+                    raise ConflictError(
+                        "worker %s registration has expired" % worker_id, "worker_expired"
+                    )
             run = self.get_run(tenant, run_id)
             not_before = run.get("not_before")
             if not_before is not None and float(not_before) > now:
