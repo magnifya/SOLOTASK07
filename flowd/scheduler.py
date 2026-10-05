@@ -130,6 +130,71 @@ def normalize_params(value):
     return value
 
 
+def normalize_schedule_id(value):
+    """Validate a schedule id: a string that is non-empty after trimming."""
+    if not isinstance(value, str):
+        raise WorkflowError("schedule_id must be a string", "bad_schedule_id")
+    schedule_id = value.strip()
+    if not schedule_id:
+        raise WorkflowError("schedule_id must be a non-empty string", "bad_schedule_id")
+    return schedule_id
+
+
+def normalize_interval_seconds(value):
+    """Validate a schedule interval.
+
+    The value must be a finite number strictly greater than zero; booleans,
+    strings, ``NaN`` and infinities are rejected.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise WorkflowError("interval_seconds must be a finite positive number",
+                            "bad_interval")
+    try:
+        seconds = float(value)
+    except OverflowError:
+        seconds = float("inf")
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise WorkflowError("interval_seconds must be a finite positive number",
+                            "bad_interval")
+    return seconds
+
+
+def normalize_first_at(value):
+    """Validate an optional schedule first-fire time in UTC Unix seconds.
+
+    ``None`` (omitted or explicit ``null``) means the creation time and is
+    filled in by the caller.  Otherwise the value must be a finite,
+    non-negative int or float (booleans, strings, NaN and infinities are
+    rejected).
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise WorkflowError(
+            "first_at must be a finite non-negative number of Unix seconds or null",
+            "bad_first_at",
+        )
+    try:
+        seconds = float(value)
+    except OverflowError:
+        seconds = float("inf")
+    if not math.isfinite(seconds) or seconds < 0:
+        raise WorkflowError(
+            "first_at must be a finite non-negative number of Unix seconds or null",
+            "bad_first_at",
+        )
+    return seconds
+
+
+def normalize_schedule_params(value):
+    """Validate ``params`` on a schedule: object only, null/omit = ``{}``."""
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise WorkflowError("params must be a JSON object", "bad_params")
+    return value
+
+
 def normalize_not_before(value):
     """Validate an optional delayed-start time in UTC Unix seconds.
 
@@ -260,7 +325,7 @@ class Scheduler:
         return self.store.save_workflow(tenant, workflow_id, steps)
 
     def start_run(self, tenant, workflow_id, run_id=None, params=None, max_parallelism=None,
-                  idempotency_key=None, not_before=None):
+                  idempotency_key=None, not_before=None, schedule_id=None, scheduled_at=None):
         key = normalize_idempotency_key(idempotency_key)
         max_parallelism = normalize_max_parallelism(max_parallelism)
         if key is not None:
@@ -269,18 +334,20 @@ class Scheduler:
         with self.store.locked():
             if key is not None:
                 return self._start_idempotent_run(
-                    tenant, workflow_id, run_id, params, max_parallelism, key, not_before
+                    tenant, workflow_id, run_id, params, max_parallelism, key, not_before,
+                    schedule_id, scheduled_at
                 )
             plan = self.store.get_workflow(tenant, workflow_id)
             run_id = run_id or self.store.generate_run_id()
             if self.store.run_exists(run_id) == tenant:
                 raise WorkflowError("run already exists: %s" % run_id, "duplicate_run")
             run = new_run(tenant, workflow_id, run_id, params, plan, self._iso(),
-                          max_parallelism=max_parallelism, not_before=not_before)
+                          max_parallelism=max_parallelism, not_before=not_before,
+                          schedule_id=schedule_id, scheduled_at=scheduled_at)
             return self._create_run(run, plan)
 
     def _start_idempotent_run(self, tenant, workflow_id, run_id, params, max_parallelism, key,
-                              not_before):
+                              not_before, schedule_id=None, scheduled_at=None):
         """Create once per (tenant, trimmed key); replay identical requests.
 
         Runs inside the store lock so concurrent identical requests share one
@@ -312,7 +379,8 @@ class Scheduler:
             raise WorkflowError("run already exists: %s" % run_id, "duplicate_run")
         run = new_run(tenant, workflow_id, run_id, params, plan, self._iso(),
                       max_parallelism=max_parallelism, idempotency_key=key,
-                      not_before=not_before)
+                      not_before=not_before, schedule_id=schedule_id,
+                      scheduled_at=scheduled_at)
         self._create_run(run, plan)
         index[key] = {"run_id": run_id}
         self.store.save_idempotency(tenant, index)
@@ -366,6 +434,95 @@ class Scheduler:
             if tenant is None:
                 raise WorkflowError("unknown run: %s" % run_id, "unknown_run")
         return list(self.get_run(tenant, run_id)["history"])
+
+    # -- periodic schedules -------------------------------------------
+    def create_schedule(self, tenant, schedule_id, workflow_id, interval_seconds,
+                        first_at=None, params=None, max_parallelism=None):
+        """Create a persistent periodic schedule for one tenant.
+
+        ``first_at`` omitted (or ``null``) defaults to the current time.
+        Returns the stored record; a duplicate id within the same tenant
+        conflicts (``schedule_exists``).
+        """
+        tenant = normalize_tenant(tenant)
+        schedule_id = normalize_schedule_id(schedule_id)
+        interval = normalize_interval_seconds(interval_seconds)
+        first_at = normalize_first_at(first_at)
+        params = normalize_schedule_params(params)
+        max_parallelism = normalize_max_parallelism(max_parallelism)
+        with self.store.locked():
+            schedules = self.store.load_schedules(tenant)
+            if schedule_id in schedules:
+                raise ConflictError(
+                    "schedule already exists: %s" % schedule_id, "schedule_exists"
+                )
+            plan = self.store.get_workflow(tenant, workflow_id)
+            now = self.now()
+            next_at = now if first_at is None else first_at
+            record = {
+                "tenant": tenant,
+                "schedule_id": schedule_id,
+                "workflow_id": plan["workflow_id"],
+                "interval_seconds": interval,
+                "first_at": next_at,
+                "next_at": next_at,
+                "params": params,
+                "max_parallelism": max_parallelism,
+                "created_at": self._iso(now),
+                "updated_at": self._iso(now),
+            }
+            schedules[schedule_id] = record
+            self.store.save_schedules(tenant, schedules)
+            return dict(record)
+
+    def list_schedules(self, tenant):
+        """Return the tenant's schedules sorted by schedule_id."""
+        tenant = normalize_tenant(tenant)
+        with self.store.locked():
+            schedules = self.store.load_schedules(tenant)
+            return [dict(schedules[sid]) for sid in sorted(schedules)]
+
+    def dispatch_schedule(self, tenant, schedule_id):
+        """Fire a schedule when due.
+
+        Returns ``(run, scheduled_at)`` when a run was created, or
+        ``(None, None)`` when the schedule is not yet due (HTTP 204).  Only
+        the single due trigger point is processed per call: ``next_at``
+        advances by exactly one interval, so a repeat before the next
+        trigger is due changes nothing and missed trigger points are caught
+        up one per call in chronological order.
+        """
+        tenant = normalize_tenant(tenant)
+        schedule_id = normalize_schedule_id(schedule_id)
+        now = self.now()
+        with self.store.locked():
+            owner = self.store.schedule_exists(schedule_id)
+            if owner is None:
+                raise WorkflowError(
+                    "unknown schedule: %s" % schedule_id, "unknown_schedule"
+                )
+            if owner != tenant:
+                raise WorkflowError(
+                    "schedule %s belongs to another tenant" % schedule_id, "cross_tenant"
+                )
+            schedules = self.store.load_schedules(tenant)
+            record = schedules[schedule_id]
+            scheduled_at = float(record["next_at"])
+            if now < scheduled_at:
+                return None, None
+            run = self.start_run(
+                tenant,
+                record["workflow_id"],
+                params=record.get("params") or {},
+                max_parallelism=record.get("max_parallelism"),
+                schedule_id=schedule_id,
+                scheduled_at=scheduled_at,
+            )
+            record["next_at"] = scheduled_at + float(record["interval_seconds"])
+            record["updated_at"] = self._iso(now)
+            schedules[schedule_id] = record
+            self.store.save_schedules(tenant, schedules)
+            return run, scheduled_at
 
     # -- worker registry -----------------------------------------------
     def _worker_view(self, record, now=None):
@@ -738,7 +895,9 @@ class Scheduler:
                           stored["created_at"],
                           max_parallelism=stored.get("max_parallelism"),
                           idempotency_key=stored.get("idempotency_key"),
-                          not_before=stored.get("not_before"))
+                          not_before=stored.get("not_before"),
+                          schedule_id=stored.get("schedule_id"),
+                          scheduled_at=stored.get("scheduled_at"))
         steps = rebuilt["steps"]
         for event in stored["history"]:
             sid, etype, at = event.get("step_id"), event.get("type"), event.get("at")

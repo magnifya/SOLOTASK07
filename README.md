@@ -9,7 +9,8 @@ access, no third-party imports.
 
 Data lives in a single directory: `<root>/<tenant>/workflows.json`,
 `<root>/<tenant>/idempotency.json` (idempotency-key → run bindings),
-`<root>/<tenant>/workers.json` (worker registrations) plus
+`<root>/<tenant>/workers.json` (worker registrations),
+`<root>/<tenant>/schedules.json` (periodic schedules) plus
 `<root>/<tenant>/runs/<run_id>.json`, written atomically, so restarting the
 process sees exactly the same state.
 
@@ -58,6 +59,9 @@ the only accepted values are `task` and `approval`.
 | POST | `/v1/workers/register` | 201 new registration, 200 refreshed registration | 400 bad tenant/worker_id/lease_seconds/JSON |
 | POST | `/v1/workers/{worker_id}/heartbeat` | 200 registration record | 400 bad tenant/lease_seconds/JSON, 404 unknown worker, 409 worker_expired |
 | GET | `/v1/workers?tenant=` | 200 `{"tenant":...,"items":[...]}` sorted by worker_id | 400 missing tenant |
+| POST | `/v1/schedules` | 201 schedule record with `next_at` | 400 bad_tenant/bad_schedule_id/bad_interval/bad_first_at/bad_params/bad_max_parallelism/bad JSON, 404 unknown workflow, 409 schedule_exists |
+| GET | `/v1/schedules?tenant=` | 200 `{"tenant":...,"items":[...]}` sorted by schedule_id | 400 missing tenant |
+| POST | `/v1/schedules/{schedule_id}/dispatch` | 201 scheduled run, 204 not due yet | 400 bad_tenant/bad_schedule_id/bad JSON, 403 cross-tenant, 404 unknown schedule |
 | GET | `/v1/runs?tenant=&status=&limit=&after=` | 200 `{"items":[...],"next_after":...}` | 400 missing tenant |
 
 Errors are always `{"error": "<message>"}`.
@@ -120,6 +124,62 @@ The scheduled time is part of the run document and survives a restart:
 value is reported as `not_before` on the create response, run details, the
 run listing and `flowd status`; runs written by older versions read it
 back as `null`.
+
+### Periodic schedules
+
+`POST /v1/schedules` creates a persistent periodic schedule for a tenant:
+
+```json
+{"tenant": "acme", "schedule_id": "nightly", "workflow_id": "etl",
+ "interval_seconds": 3600, "first_at": 1700003600,
+ "params": {"mode": "full"}, "max_parallelism": 4}
+```
+
+`first_at`, `params` and `max_parallelism` are optional. Times are UTC
+Unix seconds (ints or floats): omitting `first_at` (or passing `null`)
+uses the creation moment, so the schedule is immediately due. The trimmed
+`schedule_id` must be non-empty; `interval_seconds` must be a finite
+number strictly greater than zero (booleans, strings, zero, negatives,
+`NaN` and infinities are rejected); `first_at` must be a finite
+non-negative number; `params` must be a JSON object (omit/`null` → `{}`);
+`max_parallelism` uses the usual positive-integer validation. The error
+codes are `bad_tenant`, `bad_schedule_id`, `bad_interval`, `bad_first_at`,
+`bad_params`, `bad_max_parallelism`; an unknown workflow is
+`unknown_workflow` (404) and a duplicate id within the same tenant is
+`schedule_exists` (409). The response is the stored record and includes
+`first_at` and `next_at`. `GET /v1/schedules?tenant=` returns the
+tenant's schedules sorted by `schedule_id`.
+
+Schedules do not run on a timer: they produce runs only when an
+external trigger calls
+`POST /v1/schedules/{schedule_id}/dispatch` with `{"tenant": ...}`.
+
+- Before the schedule is due (`now < next_at`) the response is **204**
+  with no body: no run is created and neither `next_at`, `updated_at`,
+  any run, lease nor history is touched. An unknown schedule returns 404
+  (`unknown_schedule`); another tenant's schedule returns 403
+  (`cross_tenant`), checked before any firing.
+- When due, the call atomically creates **one** run for exactly the
+  current trigger point `scheduled_at = next_at` and advances
+  `next_at += interval_seconds`. The run is created by the ordinary
+  `POST /v1/runs` path (`first_at <= now`, so roots open normally),
+  inheriting the schedule's `params` and `max_parallelism`, and carries
+  `schedule_id` and `scheduled_at`. The response is **201** with the
+  normal run body. Repeating the dispatch before the next trigger is due
+  returns 204 and never creates a second run, because the create and the
+  `next_at` advance happen together under the store lock.
+- If several trigger points were missed, each due dispatch processes the
+  oldest one (`scheduled_at` values come out in chronological order);
+  callers simply repeat dispatch until they get a 204 to catch up.
+
+The schedule record and `next_at` live in `<tenant>/schedules.json` and
+survive a process restart over the same data directory. Runs created by
+a schedule are ordinary runs in every respect — execution, approvals,
+retries, lease takeover, heartbeat, idempotency and replay are unchanged
+— and manual `POST /v1/runs` still creates exactly one run, reported
+with `schedule_id` and `scheduled_at` set to `null`. Both fields also
+appear on run detail/listing responses and `Scheduler.replay`; runs
+written by older versions read them back as `null`.
 
 ### Tenant-scoped idempotency keys
 
@@ -278,7 +338,7 @@ states from that history and agrees with the stored document.
 
 ```
 flowd/model.py      DAG validation + topological order
-flowd/store.py      atomic JSON persistence, tenants, runs, history
+flowd/store.py      atomic JSON persistence, tenants, runs, history, schedules
 flowd/scheduler.py  claim/complete/fail, leases, retries, replay
 flowd/http_app.py   ThreadingHTTPServer API
 flowd/cli.py        argv parsing and JSON output
