@@ -133,6 +133,24 @@ class FairClaimHttpTest(unittest.TestCase):
         status, run = self.call("GET", "/v1/runs/r1?tenant=acme")
         self.assertEqual(run["history_length"], 1)  # still just run_created
 
+    def test_run_with_only_a_waiting_retry_is_skipped(self):
+        self.prepare(run_id="r-retry", workflow_id="flaky",
+                     steps=[{"id": "only", "depends_on": [], "max_attempts": 2}])
+        self.prepare(run_id="r-fresh")
+        status, _ = self.call("POST", "/v1/runs/r-retry/claim",
+                              {"tenant": "acme", "worker_id": "w1"})
+        self.assertEqual(status, 200)
+        status, _ = self.call("POST", "/v1/runs/r-retry/fail",
+                              {"tenant": "acme", "step_id": "only", "worker_id": "w1"})
+        self.assertEqual(status, 200)
+        # r-retry's only task is waiting out its backoff: r-fresh is served.
+        status, body = self.claim()
+        self.assertEqual((status, body["run_id"]), (200, "r-fresh"))
+        status, body = self.claim()
+        self.assertEqual((status, body["run_id"]), (200, "r-fresh"))
+        # r-fresh is drained and r-retry is still backing off.
+        self.assertEqual(self.claim(), (204, None))
+
     # -- worker registry gate ---------------------------------------------
     def test_worker_registration_gate(self):
         self.prepare()

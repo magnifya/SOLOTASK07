@@ -88,7 +88,10 @@ The call scans the tenant's runs. First, sleeping runs whose `not_before`
 has come due are activated (root nodes opened, one `ready`/`waiting` event
 each) in `run_id` order. Then, among the candidates — runs that are not
 terminal, not still sleeping, hold at least one `ready` ordinary task
-(approval-only runs never qualify) and have not reached their
+whose retry backoff has elapsed (a run whose only ready tasks are still
+waiting out their `next_attempt_at` is skipped, and its fairness count is
+unchanged because no `claim` event is appended; approval-only runs never
+qualify) and have not reached their
 `max_parallelism` — the winner is chosen by fairness: fewest `claim`
 events in the run's history, then `created_at`, then `run_id`. Expired
 leases are reclaimed with the usual `takeover` events before slots are
@@ -346,7 +349,16 @@ approval steps instead go `pending` -> `waiting` -> `succeeded` | `failed`.
   waiting approvals are never claimed.
 - `complete` moves `running` -> `succeeded` and is idempotent for the same worker.
 - `fail` increments the attempt; while attempts remain the step returns to `ready`
-  with `next_attempt_at = now + base * 2**(attempt-1)` (default base 1s).
+  with `next_attempt_at = now + base * 2**(attempt-1)` (default base 1s). Until
+  that instant is reached the step is `ready` but not leasable: `claim` and the
+  tenant-wide fair claim skip it (other due `ready` steps are still leased in the
+  usual order), and once `now >= next_attempt_at` it can be claimed again, which
+  clears `next_attempt_at`. A claim that finds nothing due appends no `claim`
+  event and — unless it reclaimed an expired lease or activated a sleeping run —
+  leaves the run's state, history and `updated_at` untouched. The retry instant
+  is recorded on the `retry` history event, so `Scheduler.replay` and a fresh
+  scheduler over the same data directory restore the same `attempt`,
+  `next_attempt_at` and claimability while the backoff is still pending.
 - Approval nodes take no lease and no retries (`attempt` stays 0); `complete`
   and `fail` against them return 409. A `decision` of `approve` succeeds the
   node and promotes successors; `reject` fails the node and the whole run.

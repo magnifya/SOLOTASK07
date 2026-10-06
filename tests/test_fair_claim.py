@@ -17,6 +17,7 @@ from flowd.store import WorkflowStore
 
 FAN = [{"id": "a", "depends_on": []}, {"id": "b", "depends_on": []}]
 SOLO = [{"id": "only", "depends_on": [], "max_attempts": 1}]
+FLAKY = [{"id": "only", "depends_on": [], "max_attempts": 3}]
 APPROVAL = [{"id": "gate", "depends_on": [], "kind": "approval"}]
 
 
@@ -162,6 +163,37 @@ class FairClaimTest(unittest.TestCase):
         run = self.scheduler.get_run("acme", "r1")
         self.assertEqual(run["steps"]["gate"]["status"], "waiting")
         self.assertIn("waiting", self.history_types("r1"))
+
+    # -- retry backoff ---------------------------------------------------
+    def test_run_with_only_a_waiting_retry_is_skipped(self):
+        self.submit(FLAKY, workflow_id="flaky")
+        self.submit()
+        self.start("r-retry", workflow_id="flaky")
+        self.start("r-fresh")
+        self.scheduler.claim("acme", "r-retry", "w1")
+        self.scheduler.fail("acme", "r-retry", "only", "w1", error="boom")
+        # r-retry's only task is waiting out its backoff: r-fresh wins, and
+        # r-retry's fairness count (one claim) is unchanged.
+        self.assertEqual(self.claim()[0], "r-fresh")
+        self.assertEqual(self.history_types("r-retry").count("claim"), 1)
+        self.assertEqual(self.claim()[0], "r-fresh")
+        # r-fresh is drained and r-retry is still waiting: nothing to lease.
+        self.assertIsNone(self.claim())
+        self.clock.advance(1)  # backoff (1s) elapsed
+        result = self.claim()
+        self.assertEqual(result[0], "r-retry")
+        self.assertEqual(result[1]["id"], "only")
+        self.assertIsNone(result[1]["next_attempt_at"])
+
+    def test_waiting_retry_inside_winning_run_does_not_block_due_steps(self):
+        self.submit()
+        self.start("r1")
+        self.scheduler.claim("acme", "r1", "w1")
+        self.scheduler.fail("acme", "r1", "a", "w1", error="boom")
+        # "a" backs off, but "b" is due in the same run.
+        result = self.claim()
+        self.assertEqual((result[0], result[1]["id"]), ("r1", "b"))
+        self.assertIsNone(self.claim())
 
     # -- worker registry gate -------------------------------------------
     def test_unregistered_worker_is_rejected_once_registry_exists(self):

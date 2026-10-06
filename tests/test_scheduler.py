@@ -126,18 +126,73 @@ class RetryTest(SchedulerTestBase):
         self.assertEqual(step["next_attempt_at"], "2023-11-14T22:13:21.000000Z")
         # no step is running or succeeded, so the run falls back to pending
         self.assertEqual(run["status"], "pending")
+        # The backoff has not elapsed: the step cannot be leased again yet.
+        self.assertIsNone(self.claim(run_id))
 
+        self.clock.advance(1)  # next_attempt_at reached
         claimed = self.claim(run_id)  # attempt 2
         self.assertEqual((claimed["id"], claimed["attempt"]), ("s", 1))
+        self.assertIsNone(claimed["next_attempt_at"])
         run = self.scheduler.fail("acme", run_id, "s", "w1", "boom")
-        self.assertEqual(run["steps"]["s"]["next_attempt_at"], "2023-11-14T22:13:22.000000Z")
+        self.assertEqual(run["steps"]["s"]["next_attempt_at"], "2023-11-14T22:13:23.000000Z")
 
+        self.clock.advance(2)  # second backoff elapsed
         self.claim(run_id)  # attempt 3
         run = self.scheduler.fail("acme", run_id, "s", "w1", "boom")
         self.assertEqual((run["steps"]["s"]["status"], run["steps"]["s"]["attempt"]),
                          ("failed", 3))
         self.assertEqual(run["status"], "failed")
         self.assertIsNone(self.claim(run_id))
+
+    def test_early_claim_during_backoff_changes_nothing(self):
+        self.workflow("flaky", [{"id": "s", "depends_on": [], "max_attempts": 3}])
+        run = self.scheduler.start_run("acme", "flaky")
+        run_id = run["run_id"]
+        self.claim(run_id)
+        before = self.scheduler.fail("acme", run_id, "s", "w1", "boom")
+        self.assertIsNone(self.claim(run_id))
+        after = self.scheduler.get_run("acme", run_id)
+        self.assertEqual(after["status"], before["status"])
+        self.assertEqual(after["updated_at"], before["updated_at"])
+        self.assertEqual([e["type"] for e in after["history"]],
+                         [e["type"] for e in before["history"]])
+        # The exact boundary is claimable and clears the schedule.
+        self.clock.advance(1)
+        claimed = self.claim(run_id)
+        self.assertEqual((claimed["id"], claimed["next_attempt_at"]), ("s", None))
+
+    def test_waiting_retry_does_not_block_other_ready_steps(self):
+        self.workflow("fan", [{"id": "a", "depends_on": [], "max_attempts": 3},
+                              {"id": "b", "depends_on": []}])
+        run = self.scheduler.start_run("acme", "fan")
+        run_id = run["run_id"]
+        self.assertEqual(self.claim(run_id)["id"], "a")
+        self.scheduler.fail("acme", run_id, "a", "w1", "boom")
+        # "a" is waiting out its backoff, but "b" is due and claimable.
+        claimed = self.claim(run_id, worker="w2")
+        self.assertEqual(claimed["id"], "b")
+        self.assertIsNone(self.claim(run_id, worker="w3"))
+        self.clock.advance(1)
+        self.assertEqual(self.claim(run_id, worker="w3")["id"], "a")
+
+    def test_retry_schedule_survives_replay_and_restart(self):
+        self.workflow("flaky", [{"id": "s", "depends_on": [], "max_attempts": 3}])
+        run = self.scheduler.start_run("acme", "flaky")
+        run_id = run["run_id"]
+        self.claim(run_id)
+        stored = self.scheduler.fail("acme", run_id, "s", "w1", "boom")
+        replayed = self.scheduler.replay("acme", run_id)
+        step = replayed["steps"]["s"]
+        self.assertEqual((step["status"], step["attempt"]),
+                         (stored["steps"]["s"]["status"], 1))
+        self.assertEqual(step["next_attempt_at"], stored["steps"]["s"]["next_attempt_at"])
+        # A fresh scheduler over the same directory agrees while waiting.
+        fresh = Scheduler(WorkflowStore(self.root, clock=self.clock), clock=self.clock)
+        self.assertIsNone(fresh.claim("acme", run_id, "w2", 30))
+        again = fresh.get_run("acme", run_id)["steps"]["s"]
+        self.assertEqual(again["next_attempt_at"], stored["steps"]["s"]["next_attempt_at"])
+        self.clock.advance(1)
+        self.assertEqual(fresh.claim("acme", run_id, "w2", 30)["id"], "s")
 
     def test_backoff_formula(self):
         self.assertEqual([backoff_seconds(n) for n in (1, 2, 3, 4)], [1.0, 2.0, 4.0, 8.0])
@@ -155,6 +210,7 @@ class RetryTest(SchedulerTestBase):
         run = self.scheduler.start_run("acme", "flaky")
         self.claim(run["run_id"])
         self.scheduler.fail("acme", run["run_id"], "s", "w1", "boom")
+        self.clock.advance(1)  # wait out the backoff before re-claiming
         self.claim(run["run_id"])
         stored = self.complete(run["run_id"], "s", result={"ok": True})
         replayed = self.scheduler.replay("acme", run["run_id"])

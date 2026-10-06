@@ -4,6 +4,7 @@ import json
 import shutil
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -124,7 +125,17 @@ class HttpTest(unittest.TestCase):
         step = body["steps"][0]
         self.assertEqual((step["status"], step["attempt"]), ("ready", 1))
         self.assertIsNotNone(step["next_attempt_at"])
-        self.claim("r2")
+        # The backoff (1s by default) has not elapsed: no claim, no history.
+        self.assertEqual(self.claim("r2"), (204, None))
+        status, run = self.call("GET", "/v1/runs/r2?tenant=acme")
+        self.assertEqual(run["history_length"], body["history_length"])
+        deadline = time.time() + 5
+        while True:  # poll until the retry becomes due
+            status, body = self.claim("r2")
+            if status == 200:
+                break
+            self.assertLess(time.time(), deadline, "retry never became claimable")
+            time.sleep(0.05)
         status, body = self.call("POST", "/v1/runs/r2/fail",
                                  {"tenant": "acme", "step_id": "s", "worker_id": "w1",
                                   "error": "boom again"})

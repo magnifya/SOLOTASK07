@@ -127,9 +127,14 @@ class QuotaEnforcementTest(QuotaTestBase):
         self.assertEqual(self.claim()["id"], "a")
         self.assertIsNone(self.claim(worker="w2"))
         self.scheduler.fail("acme", "r1", "a", "w1", "boom")
-        # the retry slot is freed; deterministic order still hands out "a"
+        # the slot is freed; "a" is backing off, so the due step "b" is leased
         again = self.claim(worker="w2")
-        self.assertEqual((again["id"], again["status"], again["attempt"]), ("a", "running", 1))
+        self.assertEqual((again["id"], again["status"], again["attempt"]), ("b", "running", 0))
+        self.assertIsNone(self.claim(worker="w3"))  # slot held, "a" still waiting
+        self.clock.advance(1)  # backoff elapsed: the retry is due again
+        self.scheduler.complete("acme", "r1", "b", "w2")
+        retry = self.claim(worker="w3")
+        self.assertEqual((retry["id"], retry["status"], retry["attempt"]), ("a", "running", 1))
 
     def test_same_worker_holding_multiple_tasks_is_counted_per_task(self):
         self.workflow()
