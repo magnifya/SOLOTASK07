@@ -42,7 +42,10 @@ python3 -m flowd --data-dir ./flowd_data list --tenant acme
 `steps.json` is a JSON list of steps, e.g.
 `[{"id": "step1", "depends_on": []}, {"id": "step2", "depends_on": ["step1"], "max_attempts": 3}]`.
 A step may set `"kind": "approval"` (default `"task"`) to insert a human gate;
-the only accepted values are `task` and `approval`.
+the only accepted values are `task` and `approval`.  A step may also set
+`"trigger_rule"` (default `"all_success"`); the accepted values are
+`all_success`, `all_done` and `any_success` (see
+[Trigger rules](#trigger-rules-and-skipped-steps)).
 
 ## HTTP API
 
@@ -83,9 +86,10 @@ stored in `<tenant>/audit.json` and readable via
 ```
 
 Run actions reuse the existing history types (`run_created`, `ready`,
-`waiting`, `claim`, `heartbeat`, `takeover`, `complete`, `fail`, `retry`,
-`attempts_exhausted`, `decision`, `cancel`, `run_started`, `run_succeeded`,
-`run_failed`, `run_cancelled`); control-plane operations use fixed `resource.action`
+`waiting`, `skipped`, `claim`, `heartbeat`, `takeover`, `complete`, `fail`,
+`retry`, `attempts_exhausted`, `decision`, `cancel`, `run_started`,
+`run_succeeded`, `run_failed`, `run_cancelled`); control-plane operations use
+fixed `resource.action`
 identifiers: `workflow.submit`, `worker.register`, `worker.heartbeat`,
 `schedule.create` and `schedule.dispatch`. Records carry only identifiers
 and the actor (the decision maker on `decision` records, the canceller on
@@ -421,6 +425,8 @@ heartbeats and listing append nothing to any run's history and never touch
 
 Step states: `pending` -> `ready` -> `running` -> `succeeded` | `failed`;
 approval steps instead go `pending` -> `waiting` -> `succeeded` | `failed`.
+A step whose dependencies can never satisfy its trigger rule becomes
+`skipped` (a terminal state) without ever running.
 
 - A step starts `pending` and becomes `ready` only when **all** dependencies are `succeeded`.
   Root steps open immediately at run creation unless the run has a future `not_before`, in
@@ -453,12 +459,15 @@ approval steps instead go `pending` -> `waiting` -> `succeeded` | `failed`.
 - Claim order is deterministic: `(topological index, step id)`, at most one active
   lease per step.
 
-Run states: `pending` -> `running` -> `succeeded` | `failed`.
+Run states: `pending` -> `running` -> `succeeded` | `failed`
+(`cancelled` via explicit cancel).
 
 - `pending` until a step is first claimed; `running` while work is outstanding.
 - `succeeded` when every step is `succeeded`.
 - `failed` as soon as any step exhausts `max_attempts` (default 3) or an
-  approval is rejected.
+  approval is rejected.  Runs containing non-`all_success` trigger rules
+  instead finish only when every node is terminal — see
+  [Trigger rules](#trigger-rules-and-skipped-steps).
 
 Every transition appends `{"at","run_id","step_id","type","attempt","worker_id"}`
 to the run's append-only history (a `decision` event additionally carries
@@ -466,6 +475,45 @@ to the run's append-only history (a `decision` event additionally carries
 `lease_deadline`; a `retry` event carries the scheduled `next_attempt_at`);
 `Scheduler.replay(tenant, run_id)` rebuilds the current states from that
 history and agrees with the stored document on every observable field.
+
+### Trigger rules and skipped steps
+
+Every step carries a `trigger_rule`, frozen into the run at creation time
+and reported on run details, the listing and `flowd status`.  Omitting the
+field in `POST /v1/workflows` means `all_success` — the legacy rule, so
+existing workflows and runs are unaffected.  The other accepted values are
+`all_done` and `any_success`; an explicit `null`, a non-string, an empty
+string or any other name is rejected with 400 (`bad_trigger_rule`), the
+workflow is neither saved nor overwritten and no audit record is written.
+Runs written before trigger rules existed read back as `all_success`.
+
+Scheduling treats `succeeded`, `failed`, `cancelled` and `skipped` as
+terminal step states and evaluates each pending node against its frozen
+rule:
+
+- `all_success` unlocks (task `ready`, approval `waiting`) when every
+  dependency succeeded; once a dependency is failed, cancelled or skipped
+  the node can never unlock and becomes `skipped` instead.
+- `all_done` unlocks once every dependency reached any terminal state.
+- `any_success` unlocks as soon as any dependency succeeded; once all
+  dependencies are terminal without a success the node becomes `skipped`.
+- Root nodes open immediately under all three rules.
+
+A `skipped` node never holds a lease, keeps its `attempt` and cannot be
+completed or failed; each skip records exactly one `skipped` history event
+(emitted in topological order together with the other unlock events), so
+`Scheduler.history`, `Scheduler.replay` and restarted schedulers all agree.
+When a claim finds nothing executable it still returns `None` / 204.
+
+Run completion depends on the rules frozen into the run.  A run containing
+any non-`all_success` rule stays `pending`/`running` while nodes can still
+be unlocked, are executing or await a decision, and finishes only once
+every node is terminal: `failed` when any node failed, otherwise
+`succeeded`; an explicit cancel is still `cancelled`.  A run made purely of
+`all_success` nodes keeps the legacy semantics exactly — the first
+exhausted retry or rejection fails it immediately.  Approvals, leases,
+retries, takeover, quotas, fair claim, delayed and periodic scheduling,
+idempotency, cancellation and the tenant audit stream are unchanged.
 
 ### Workflow versions and same-name submissions
 

@@ -103,7 +103,7 @@ class FairClaimHttpTest(unittest.TestCase):
         self.assertIsNotNone(step["lease_deadline"])
         self.assertEqual(set(step),
                          {"id", "kind", "status", "attempt", "max_attempts",
-                          "depends_on", "worker_id", "lease_deadline",
+                          "depends_on", "trigger_rule", "worker_id", "lease_deadline",
                           "next_attempt_at", "result", "error", "approval"})
 
     def test_lease_seconds_default_and_explicit(self):

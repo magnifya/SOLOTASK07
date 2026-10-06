@@ -5,7 +5,11 @@ A workflow is a named DAG of steps; every step is a mapping::
     {"id": "build", "depends_on": ["fetch"], "max_attempts": 3}
 
 Validation rejects duplicate ids, empty ids, unknown dependencies,
-self/cyclic dependencies and bad ``max_attempts`` values.  A validated plan
+self/cyclic dependencies and bad ``max_attempts`` values.  Each step may
+also declare a ``trigger_rule`` — ``all_success`` (the default when the
+field is omitted), ``all_done`` or ``any_success`` — governing which
+dependency outcomes unlock it; any other value (including an explicit
+``null``) is rejected with ``bad_trigger_rule``.  A validated plan
 is returned topologically sorted (ties broken by step id) so scheduling
 order is deterministic.
 """
@@ -13,13 +17,19 @@ order is deterministic.
 import heapq
 import time as _time
 
-STEP_STATES = ("pending", "ready", "running", "waiting", "succeeded", "failed", "cancelled")
+STEP_STATES = ("pending", "ready", "running", "waiting", "succeeded", "failed", "cancelled",
+               "skipped")
 RUN_STATES = ("pending", "running", "succeeded", "failed", "cancelled")
 DEFAULT_MAX_ATTEMPTS = 3
 
 KIND_TASK = "task"
 KIND_APPROVAL = "approval"
 STEP_KINDS = (KIND_TASK, KIND_APPROVAL)
+
+TRIGGER_ALL_SUCCESS = "all_success"
+TRIGGER_ALL_DONE = "all_done"
+TRIGGER_ANY_SUCCESS = "any_success"
+TRIGGER_RULES = (TRIGGER_ALL_SUCCESS, TRIGGER_ALL_DONE, TRIGGER_ANY_SUCCESS)
 
 
 class WorkflowError(Exception):
@@ -78,7 +88,20 @@ def validate_step(raw, index, seen_ids):
         raise WorkflowError(
             "step %s: kind must be one of %s" % (step_id, ", ".join(STEP_KINDS)), "bad_kind"
         )
-    return {"id": step_id, "depends_on": depends_on, "max_attempts": max_attempts, "kind": kind}
+    if "trigger_rule" in raw:
+        trigger_rule = raw["trigger_rule"]
+        if not isinstance(trigger_rule, str) or trigger_rule not in TRIGGER_RULES:
+            raise WorkflowError(
+                "step %s: trigger_rule must be one of %s"
+                % (step_id, ", ".join(TRIGGER_RULES)),
+                "bad_trigger_rule",
+            )
+    else:
+        # Omitted means the legacy rule: unlock only when all dependencies
+        # succeeded.  An explicit null is rejected like any other bad value.
+        trigger_rule = TRIGGER_ALL_SUCCESS
+    return {"id": step_id, "depends_on": depends_on, "max_attempts": max_attempts,
+            "kind": kind, "trigger_rule": trigger_rule}
 
 
 def topo_order(steps):

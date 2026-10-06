@@ -9,7 +9,15 @@ import copy
 import math
 import time as _time
 
-from .model import KIND_APPROVAL, KIND_TASK, WorkflowError, format_time
+from .model import (
+    KIND_APPROVAL,
+    KIND_TASK,
+    TRIGGER_ALL_DONE,
+    TRIGGER_ALL_SUCCESS,
+    TRIGGER_ANY_SUCCESS,
+    WorkflowError,
+    format_time,
+)
 from .store import (
     RUN_CANCELLED,
     RUN_FAILED,
@@ -21,9 +29,11 @@ from .store import (
     STEP_PENDING,
     STEP_READY,
     STEP_RUNNING,
+    STEP_SKIPPED,
     STEP_SUCCEEDED,
     STEP_WAITING,
     TERMINAL_RUN_STATES,
+    TERMINAL_STEP_STATES,
     WorkflowStore,
     new_run,
     run_plan,
@@ -281,31 +291,93 @@ def _active_lease_count(run, now):
     )
 
 
-def _promote_pending(run, now_iso):
-    """Promote pending steps whose dependencies all succeeded.
+def _run_has_custom_trigger(run):
+    """Whether any node of the run unlocks by a rule other than all_success.
 
-    Ordinary tasks become ``ready``; approval steps become ``waiting`` for a
-    human decision.  Returns ``(ready_ids, waiting_ids)``.
+    The rule is frozen into every node at creation; runs written before
+    trigger rules existed read back as pure ``all_success`` runs.
+    """
+    return any(
+        step.get("trigger_rule", TRIGGER_ALL_SUCCESS) != TRIGGER_ALL_SUCCESS
+        for step in run["steps"].values()
+    )
+
+
+def _promote_pending(run, now_iso):
+    """Unlock or skip pending steps whose dependencies are settled.
+
+    Every pending node is evaluated in topological order against the
+    ``trigger_rule`` frozen into it at creation:
+
+    - ``all_success`` unlocks when every dependency succeeded.  Once a
+      dependency is failed, cancelled or skipped the node can never unlock,
+      so it is skipped instead — but only in runs that use custom trigger
+      rules; all-``all_success`` runs keep the legacy semantics exactly
+      (the run has already failed and pending nodes simply stay pending).
+    - ``all_done`` unlocks once every dependency reached a terminal state
+      (``succeeded``, ``failed``, ``cancelled`` or ``skipped``).
+    - ``any_success`` unlocks as soon as any dependency succeeded, and is
+      skipped once all dependencies are terminal without a success.
+
+    Root nodes open immediately under every rule.  Ordinary tasks become
+    ``ready``; approval steps become ``waiting`` for a human decision.
+    Returns ``(step_id, new_status)`` pairs in topological order.
     """
     index = run["order_index"]
-    ready, waiting = [], []
+    skippable = _run_has_custom_trigger(run)
+    opened = []
     for sid in sorted(run["steps"], key=lambda s: index.get(s, 0)):
         step = run["steps"][sid]
         if step["status"] != STEP_PENDING:
             continue
-        if all(run["steps"][d]["status"] == STEP_SUCCEEDED for d in step["depends_on"]):
+        deps = [run["steps"][d] for d in step["depends_on"]]
+        rule = step.get("trigger_rule", TRIGGER_ALL_SUCCESS)
+        skip = False
+        if not deps:
+            unlock = True
+        elif rule == TRIGGER_ALL_DONE:
+            unlock = all(d["status"] in TERMINAL_STEP_STATES for d in deps)
+        elif rule == TRIGGER_ANY_SUCCESS:
+            unlock = any(d["status"] == STEP_SUCCEEDED for d in deps)
+            skip = not unlock and all(d["status"] in TERMINAL_STEP_STATES for d in deps)
+        else:
+            unlock = all(d["status"] == STEP_SUCCEEDED for d in deps)
+            skip = not unlock and skippable and any(
+                d["status"] in (STEP_FAILED, STEP_CANCELLED, STEP_SKIPPED) for d in deps)
+        if skip:
+            step["status"] = STEP_SKIPPED
+            opened.append((sid, STEP_SKIPPED))
+        elif unlock:
             if step.get("kind") == KIND_APPROVAL:
                 step["status"] = STEP_WAITING
-                waiting.append(sid)
+                opened.append((sid, STEP_WAITING))
             else:
                 step["status"], step["ready_at"] = STEP_READY, now_iso
-                ready.append(sid)
-    return ready, waiting
+                opened.append((sid, STEP_READY))
+    return opened
 
 
 def _derive_run_status(run):
-    """Derive the run status from its steps; stays ``pending`` until claimed."""
+    """Derive the run status from its steps; stays ``pending`` until claimed.
+
+    A run using custom trigger rules keeps going while any node can still
+    be unlocked, is executing or awaits a decision, and finishes only once
+    every node is terminal: ``failed`` when any node failed, otherwise
+    ``succeeded`` (an explicit cancel shows up as cancelled nodes and stays
+    ``cancelled``).  All-``all_success`` runs keep the legacy rule: the
+    first exhausted attempt or rejection fails the run immediately.
+    """
     steps = list(run["steps"].values())
+    if _run_has_custom_trigger(run):
+        if any(s["status"] == STEP_CANCELLED for s in steps):
+            return RUN_CANCELLED
+        if steps and all(s["status"] in TERMINAL_STEP_STATES for s in steps):
+            if any(s["status"] == STEP_FAILED for s in steps):
+                return RUN_FAILED
+            return RUN_SUCCEEDED
+        if any(s["status"] in (STEP_RUNNING, STEP_SUCCEEDED) for s in steps):
+            return RUN_RUNNING
+        return RUN_PENDING
     if any(s["status"] == STEP_FAILED for s in steps):
         return RUN_FAILED
     if any(s["status"] == STEP_CANCELLED for s in steps):
@@ -443,20 +515,19 @@ class Scheduler:
         return self.store.save_run(run)
 
     def _open_root_nodes(self, run, when=None):
-        """Promote every pending node whose dependencies all succeeded.
+        """Settle every pending node whose dependencies are decided.
 
-        Each promoted node records exactly one ``ready`` or ``waiting``
-        history event, so calling this on repeated claims never re-opens a
-        node.  Returns ``(ready_ids, waiting_ids)``.
+        Each unlocked or skipped node records exactly one ``ready``,
+        ``waiting`` or ``skipped`` history event, emitted in topological
+        order, so calling this on repeated claims never re-opens a node.
+        Returns the ``(step_id, new_status)`` transitions.
         """
         now_iso = self._iso() if when is None else when
-        ready, waiting = _promote_pending(run, now_iso)
-        for sid in ready:
-            self._event(run, run["run_id"], sid, "ready",
-                        attempt=run["steps"][sid]["attempt"])
-        for sid in waiting:
-            self._event(run, run["run_id"], sid, "waiting", attempt=0)
-        return ready, waiting
+        opened = _promote_pending(run, now_iso)
+        for sid, status in opened:
+            attempt = 0 if status == STEP_WAITING else run["steps"][sid]["attempt"]
+            self._event(run, run["run_id"], sid, status, attempt=attempt)
+        return opened
 
     def get_run(self, tenant, run_id):
         run = self.store.load_run(tenant, run_id)
@@ -862,7 +933,7 @@ class Scheduler:
                         run["updated_at"] = self._iso()
                         self.store.save_run(run)
                     return None
-            opened_ready, opened_waiting = self._open_root_nodes(run)
+            opened = self._open_root_nodes(run)
             now_iso = self._iso()
             candidates = [s for s in run["steps"].values()
                           if s["status"] == STEP_READY and _retry_due(s, now_iso)]
@@ -877,7 +948,7 @@ class Scheduler:
                             lease_deadline=now + float(lease_seconds), started_at=self._iso())
                 self._event(run, run_id, step["id"], "claim", attempt=step["attempt"],
                             worker_id=worker_id, lease_deadline=step["lease_deadline"])
-            elif not reclaimed and not opened_ready and not opened_waiting:
+            elif not reclaimed and not opened:
                 # Nothing to lease and nothing else changed: keep the stored
                 # state, history and updated_at untouched.
                 return None
@@ -1078,6 +1149,11 @@ class Scheduler:
             run["status"] = _derive_run_status(run)
             if run["status"] == RUN_SUCCEEDED:
                 self._event(run, run_id, None, "run_succeeded")
+            elif run["status"] == RUN_FAILED:
+                # A run with custom trigger rules finishes only when every
+                # node is terminal, so the last completion may close it as
+                # failed (a sibling branch failed earlier).
+                self._event(run, run_id, None, "run_failed")
             run["updated_at"] = self._iso()
             self.store.save_run(run)
             return run
@@ -1104,6 +1180,9 @@ class Scheduler:
                 step.update(status=STEP_FAILED, finished_at=self._iso(), next_attempt_at=None)
                 self._event(run, run_id, step_id, "attempts_exhausted", attempt=step["attempt"],
                             worker_id=worker_id)
+                # A terminal failure settles dependents: custom-rule nodes
+                # may now unlock (all_done) or skip (all_success/any_success).
+                self._open_root_nodes(run)
             else:
                 step.update(status=STEP_READY, ready_at=self._iso(),
                             next_attempt_at=self._iso(now + backoff_seconds(
@@ -1160,7 +1239,7 @@ class Scheduler:
             index = run["order_index"]
             for sid in sorted(run["steps"], key=lambda s: index.get(s, 0)):
                 step = run["steps"][sid]
-                if step["status"] in (STEP_SUCCEEDED, STEP_FAILED, STEP_CANCELLED):
+                if step["status"] in TERMINAL_STEP_STATES:
                     continue
                 holder = step.get("worker_id")
                 step.update(status=STEP_CANCELLED, worker_id=None, lease_deadline=None,
@@ -1215,11 +1294,13 @@ class Scheduler:
             previous = run["status"]
             if decision == "approve":
                 step.update(status=STEP_SUCCEEDED, finished_at=at)
-                self._open_root_nodes(run, at)
-                run["status"] = _derive_run_status(run)
             else:
                 step.update(status=STEP_FAILED, finished_at=at)
-                run["status"] = RUN_FAILED
+            # Either way the node is terminal now: dependents governed by
+            # custom trigger rules may unlock or skip.  All-all_success runs
+            # derive the same immediate failure as before on a reject.
+            self._open_root_nodes(run, at)
+            run["status"] = _derive_run_status(run)
             if run["status"] == RUN_RUNNING and previous == RUN_PENDING:
                 self._event(run, run_id, None, "run_started")
             if run["status"] == RUN_SUCCEEDED:
@@ -1291,6 +1372,10 @@ class Scheduler:
                 step.update(status=STEP_READY, ready_at=at)
             elif etype == "waiting":
                 step.update(status=STEP_WAITING)
+            elif etype == "skipped":
+                # Mirrors the settle pass: the node never ran, keeps its
+                # attempt and holds no lease fields.
+                step.update(status=STEP_SKIPPED)
             elif etype == "claim":
                 step.update(status=STEP_RUNNING, worker_id=event.get("worker_id"),
                             started_at=at, lease_deadline=event.get("lease_deadline"),
