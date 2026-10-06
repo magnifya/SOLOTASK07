@@ -68,7 +68,7 @@ class _Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
         try:
-            self._route(method, path, parse_qs(parsed.query))
+            self._route(method, path, parse_qs(parsed.query), parsed.query)
         except LeaseError as exc:
             self._error(409, exc.message)
         except ConflictError as exc:
@@ -78,7 +78,7 @@ class _Handler(BaseHTTPRequestHandler):
         except Exception as exc:  # pragma: no cover - defensive
             self._error(500, "internal error: %s" % exc)
 
-    def _route(self, method, path, query):
+    def _route(self, method, path, query, raw_query=""):
         body = {}
         if method == "GET":
             if path == "/healthz":
@@ -89,6 +89,10 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._list_schedules(query)
             if path == "/v1/workers":
                 return self._list_workers(query)
+            if path == "/v1/audit":
+                # Blank values count as "provided" here: an empty tenant,
+                # action or run_id is a 400, not a missing parameter.
+                return self._list_audit(parse_qs(raw_query, keep_blank_values=True))
         elif method == "POST":
             if path == "/v1/tasks/claim":
                 return self._claim_any_task(self._body())
@@ -144,6 +148,38 @@ class _Handler(BaseHTTPRequestHandler):
             after=(query.get("after") or [None])[0],
         )
         return self._json(200, {"tenant": tenant, "items": [_run_view(r) for r in items],
+                                "next_after": next_after})
+
+    # -- audit stream ----------------------------------------------------
+    @staticmethod
+    def _query_int(query, name, default, code):
+        raw = (query.get(name) or [None])[0]
+        if raw is None:
+            return default
+        try:
+            return int(raw, 10)
+        except ValueError:
+            raise WorkflowError("%s must be an integer" % name, code)
+
+    def _list_audit(self, query):
+        tenant = (query.get("tenant") or [None])[0]
+        if not isinstance(tenant, str) or not tenant.strip():
+            raise WorkflowError("tenant must be a non-empty string", "bad_tenant")
+        limit = self._query_int(query, "limit", 100, "bad_limit")
+        if not 1 <= limit <= 1000:
+            raise WorkflowError("limit must be an integer between 1 and 1000", "bad_limit")
+        after = self._query_int(query, "after", 0, "bad_after")
+        if after < 0:
+            raise WorkflowError("after must be a non-negative integer", "bad_after")
+        action = (query.get("action") or [None])[0]
+        if action is not None and not action.strip():
+            raise WorkflowError("action must be a non-empty string", "bad_action")
+        run_id = (query.get("run_id") or [None])[0]
+        if run_id is not None and not run_id.strip():
+            raise WorkflowError("run_id must be a non-empty string", "bad_run_id")
+        items, next_after = self.scheduler.list_audit(
+            tenant, action=action, run_id=run_id, limit=limit, after=after)
+        return self._json(200, {"tenant": tenant.strip(), "items": items,
                                 "next_after": next_after})
 
     # -- periodic schedules -------------------------------------------

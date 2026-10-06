@@ -6,6 +6,7 @@ Layout::
     <root>/<tenant>/idempotency.json
     <root>/<tenant>/workers.json
     <root>/<tenant>/schedules.json
+    <root>/<tenant>/audit.json
     <root>/<tenant>/runs/<run_id>.json
 
 Every write is atomic (temp file + ``os.replace``) so a crash cannot leave a
@@ -96,6 +97,9 @@ class WorkflowStore:
     def schedules_path(self, tenant):
         return os.path.join(self.tenant_dir(tenant), "schedules.json")
 
+    def audit_path(self, tenant):
+        return os.path.join(self.tenant_dir(tenant), "audit.json")
+
     def run_path(self, tenant, run_id):
         return os.path.join(self.tenant_dir(tenant), "runs", "%s.json" % run_id)
 
@@ -153,6 +157,40 @@ class WorkflowStore:
             if schedule_id in (read_json(self.schedules_path(tenant), {}) or {}):
                 return tenant
         return None
+
+    # -- audit stream ---------------------------------------------------
+    def append_audit(self, tenant, action, at=None, run_id=None, step_id=None,
+                     workflow_id=None, schedule_id=None, worker_id=None, actor=None):
+        """Append one record to the tenant's audit stream.
+
+        The ``sequence`` is assigned under the store lock, so concurrent
+        appends stay unique and follow commit order, and it continues from
+        the persisted stream, so a restart keeps increasing.  Only
+        identifiers and the actor are stored — never params, results or
+        error text; identifiers that do not apply are ``None``.
+        """
+        with self._lock:
+            path = self.audit_path(tenant)
+            items = (read_json(path, None) or {}).get("items") or []
+            record = {
+                "sequence": (items[-1]["sequence"] + 1) if items else 1,
+                "at": at if at is not None else self.now_iso(),
+                "tenant": tenant.strip(),
+                "action": action,
+                "run_id": run_id,
+                "step_id": step_id,
+                "workflow_id": workflow_id,
+                "schedule_id": schedule_id,
+                "worker_id": worker_id,
+                "actor": actor,
+            }
+            items.append(record)
+            atomic_write_json(path, {"items": items})
+            return dict(record)
+
+    def load_audit(self, tenant):
+        """Return the tenant's audit records in sequence order (read-only)."""
+        return list((read_json(self.audit_path(tenant), None) or {}).get("items") or [])
 
     # -- runs ----------------------------------------------------------
     def save_run(self, run):

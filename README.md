@@ -10,7 +10,8 @@ access, no third-party imports.
 Data lives in a single directory: `<root>/<tenant>/workflows.json`,
 `<root>/<tenant>/idempotency.json` (idempotency-key → run bindings),
 `<root>/<tenant>/workers.json` (worker registrations),
-`<root>/<tenant>/schedules.json` (periodic schedules) plus
+`<root>/<tenant>/schedules.json` (periodic schedules),
+`<root>/<tenant>/audit.json` (the tenant's audit stream) plus
 `<root>/<tenant>/runs/<run_id>.json`, written atomically, so restarting the
 process sees exactly the same state.
 
@@ -64,8 +65,55 @@ the only accepted values are `task` and `approval`.
 | GET | `/v1/schedules?tenant=` | 200 `{"tenant":...,"items":[...]}` sorted by schedule_id | 400 missing tenant |
 | POST | `/v1/schedules/{schedule_id}/dispatch` | 201 scheduled run, 204 not due yet | 400 bad_tenant/bad_schedule_id/bad JSON, 403 cross-tenant, 404 unknown schedule |
 | GET | `/v1/runs?tenant=&status=&limit=&after=` | 200 `{"items":[...],"next_after":...}` | 400 missing tenant |
+| GET | `/v1/audit?tenant=&action=&run_id=&limit=&after=` | 200 `{"tenant":...,"items":[...],"next_after":...}` | 400 bad_tenant/bad_action/bad_run_id/bad_limit/bad_after |
 
 Errors are always `{"error": "<message>"}`.
+
+### Tenant-scoped audit stream
+
+Every state change also appends one record to the tenant's audit stream,
+stored in `<tenant>/audit.json` and readable via
+`GET /v1/audit?tenant=` (or `Scheduler.list_audit`). Each record is
+
+```json
+{"sequence": 7, "at": "2026-01-01T00:00:00.000000Z", "tenant": "acme",
+ "action": "claim", "run_id": "r1", "step_id": "step1",
+ "workflow_id": "etl", "schedule_id": null, "worker_id": "w1", "actor": null}
+```
+
+Run actions reuse the existing history types (`run_created`, `ready`,
+`waiting`, `claim`, `heartbeat`, `takeover`, `complete`, `fail`, `retry`,
+`attempts_exhausted`, `decision`, `run_started`, `run_succeeded`,
+`run_failed`); control-plane operations use fixed `resource.action`
+identifiers: `workflow.submit`, `worker.register`, `worker.heartbeat`,
+`schedule.create` and `schedule.dispatch`. Records carry only identifiers
+and the actor (the decision maker on `decision` records, `null` elsewhere)
+— never params, results or error text; identifiers that do not apply are
+`null`. When one request causes several changes (e.g. two lease takeovers
+plus a claim), the records enter the stream in the order the changes
+actually happened.
+
+`sequence` starts at 1 per tenant and is assigned under the store lock in
+commit order, so it is gap-free, unique under concurrency and keeps
+increasing across restarts. Query parameters: `tenant` is required and
+must be a non-empty string (`bad_tenant`); `limit` defaults to 100 and
+accepts only integers from 1 to 1000 (`bad_limit`); `after` defaults to 0
+and returns only records with a greater sequence (`bad_after`); `action`
+and `run_id` are optional exact-match filters that must be non-empty when
+given (`bad_action` / `bad_run_id`). The response is
+`{"tenant", "items", "next_after"}` with items in ascending sequence
+order; `next_after` is the sequence of the page's last record, or `null`
+when no further records follow. A tenant with no records returns 200 with
+empty `items`.
+
+Requests that change nothing append nothing: validation failures,
+cross-tenant rejections, read-only requests, idempotency-key replays,
+not-yet-due dispatches, lease renewals that do not extend the deadline and
+204 responses with no state change are all absent from the stream. Reading
+the audit stream never touches runs, leases, history or `updated_at`, and
+a query only ever sees the requested tenant's own records — filters cannot
+probe other tenants. Run history, `Scheduler.history`/`Scheduler.replay`,
+the other HTTP routes, error statuses and the CLI output are unchanged.
 
 ### Tenant-wide fair claim
 
@@ -387,8 +435,8 @@ states from that history and agrees with the stored document.
 
 ```
 flowd/model.py      DAG validation + topological order
-flowd/store.py      atomic JSON persistence, tenants, runs, history, schedules
-flowd/scheduler.py  claim/complete/fail, leases, retries, replay
+flowd/store.py      atomic JSON persistence, tenants, runs, history, schedules, audit
+flowd/scheduler.py  claim/complete/fail, leases, retries, replay, audit stream
 flowd/http_app.py   ThreadingHTTPServer API
 flowd/cli.py        argv parsing and JSON output
 ```

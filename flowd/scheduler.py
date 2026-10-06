@@ -341,11 +341,21 @@ class Scheduler:
                  "attempt": attempt, "worker_id": worker_id}
         event.update(extra)
         run["history"].append(event)
+        # Every persisted history event is also an audit record: run actions
+        # keep their history type as the audit action and enter the tenant
+        # stream in the order the changes actually happened.
+        self.store.append_audit(run["tenant"], etype, at=event["at"], run_id=run_id,
+                                step_id=step_id, workflow_id=run.get("workflow_id"),
+                                worker_id=worker_id, actor=extra.get("actor"))
         return event
 
     # -- workflow / run lifecycle --------------------------------------
     def submit(self, tenant, workflow_id, steps):
-        return self.store.save_workflow(tenant, workflow_id, steps)
+        with self.store.locked():
+            plan = self.store.save_workflow(tenant, workflow_id, steps)
+            self.store.append_audit(tenant, "workflow.submit",
+                                    workflow_id=plan["workflow_id"])
+            return plan
 
     def start_run(self, tenant, workflow_id, run_id=None, params=None, max_parallelism=None,
                   idempotency_key=None, not_before=None, schedule_id=None, scheduled_at=None):
@@ -451,6 +461,41 @@ class Scheduler:
     def list_runs(self, tenant, status=None, limit=50, after=None):
         return self.store.list_runs(tenant, status=status, limit=limit, after=after)
 
+    # -- audit stream ---------------------------------------------------
+    def list_audit(self, tenant, action=None, run_id=None, limit=100, after=0):
+        """Read the tenant's audit stream; never mutates any state.
+
+        Returns ``(items, next_after)`` where ``items`` are the tenant's
+        audit records with ``sequence > after`` (optionally filtered by
+        ``action`` and/or ``run_id``) in ascending sequence order, at most
+        ``limit`` of them, and ``next_after`` is the sequence of the last
+        record of the page, or ``None`` when no further records follow.
+        Only the requesting tenant's own stream is ever read.
+        """
+        tenant = normalize_tenant(tenant)
+        if action is not None:
+            if not isinstance(action, str) or not action.strip():
+                raise WorkflowError("action must be a non-empty string", "bad_action")
+            action = action.strip()
+        if run_id is not None:
+            if not isinstance(run_id, str) or not run_id.strip():
+                raise WorkflowError("run_id must be a non-empty string", "bad_run_id")
+            run_id = run_id.strip()
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1000:
+            raise WorkflowError("limit must be an integer between 1 and 1000", "bad_limit")
+        if isinstance(after, bool) or not isinstance(after, int) or after < 0:
+            raise WorkflowError("after must be a non-negative integer", "bad_after")
+        with self.store.locked():
+            matched = [r for r in self.store.load_audit(tenant) if r["sequence"] > after]
+        if action is not None:
+            matched = [r for r in matched if r["action"] == action]
+        if run_id is not None:
+            matched = [r for r in matched if r.get("run_id") == run_id]
+        matched.sort(key=lambda r: r["sequence"])
+        page = matched[:limit]
+        next_after = page[-1]["sequence"] if len(matched) > limit else None
+        return page, next_after
+
     def history(self, run_id, tenant=None):
         if tenant is None:
             tenant = self.store.run_exists(run_id)
@@ -496,6 +541,8 @@ class Scheduler:
             }
             schedules[schedule_id] = record
             self.store.save_schedules(tenant, schedules)
+            self.store.append_audit(tenant, "schedule.create", schedule_id=schedule_id,
+                                    workflow_id=plan["workflow_id"])
             return dict(record)
 
     def list_schedules(self, tenant):
@@ -545,6 +592,8 @@ class Scheduler:
             record["updated_at"] = self._iso(now)
             schedules[schedule_id] = record
             self.store.save_schedules(tenant, schedules)
+            self.store.append_audit(tenant, "schedule.dispatch", schedule_id=schedule_id,
+                                    run_id=run["run_id"])
             return run, scheduled_at
 
     # -- worker registry -----------------------------------------------
@@ -595,6 +644,7 @@ class Scheduler:
                 created = False
             workers[worker_id] = record
             self.store.save_workers(tenant, workers)
+            self.store.append_audit(tenant, "worker.register", worker_id=worker_id)
             return self._worker_view(record, now), created
 
     def heartbeat_worker(self, tenant, worker_id, lease_seconds=None):
@@ -626,6 +676,7 @@ class Scheduler:
                           expires_at_epoch=deadline)
             workers[worker_id] = record
             self.store.save_workers(tenant, workers)
+            self.store.append_audit(tenant, "worker.heartbeat", worker_id=worker_id)
             return self._worker_view(record, now)
 
     def list_workers(self, tenant):
