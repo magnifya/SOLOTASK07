@@ -5,6 +5,7 @@ history stays the single source of truth.  ``replay`` rebuilds current state
 from that history and must agree with the stored document.
 """
 
+import copy
 import math
 import time as _time
 
@@ -23,6 +24,7 @@ from .store import (
     TERMINAL_RUN_STATES,
     WorkflowStore,
     new_run,
+    run_plan,
 )
 
 
@@ -1063,9 +1065,31 @@ class Scheduler:
 
     # -- history / replay ----------------------------------------------
     def replay(self, tenant, run_id):
-        """Rebuild run state from the append-only history."""
-        stored = self.get_run(tenant, run_id)
-        plan = self.store.get_workflow(tenant, stored["workflow_id"])
+        """Rebuild run state from the run's frozen definition and history.
+
+        Nodes are rebuilt from the normalized DAG snapshotted into the run
+        document at creation time, never from the workflow currently stored
+        under the run's ``workflow_id``: a later same-name submission may
+        replace that workflow, but existing runs keep their original step
+        order, node kinds, dependencies, ``max_attempts`` and state-machine
+        semantics.  Documents written before snapshots existed reconstruct
+        the plan from the definitions and order saved in the run itself.
+
+        The result agrees with the persisted run on every observable field —
+        ``run_id``, ``workflow_id``, ``step_order``, run and per-step
+        ``status``, ``attempt``, ``worker_id``, ``lease_deadline``,
+        ``next_attempt_at``, ``ready_at``, ``started_at``, ``finished_at``,
+        ``result``, ``error`` and ``approval`` — and the append-only history
+        is the sole source of transitions, so replaying again, including
+        after a restart, yields the identical document.
+        """
+        owner = self.store.run_exists(run_id)
+        if owner is None:
+            raise WorkflowError("unknown run: %s" % run_id, "unknown_run")
+        if owner != tenant:
+            raise WorkflowError("run %s belongs to another tenant" % run_id, "cross_tenant")
+        stored = self.store.load_run(tenant, run_id)
+        plan = run_plan(stored)
         rebuilt = new_run(tenant, stored["workflow_id"], run_id, stored.get("params"), plan,
                           stored["created_at"],
                           max_parallelism=stored.get("max_parallelism"),
@@ -1073,20 +1097,27 @@ class Scheduler:
                           not_before=stored.get("not_before"),
                           schedule_id=stored.get("schedule_id"),
                           scheduled_at=stored.get("scheduled_at"))
+        # The fresh document must carry exactly the frozen snapshot and
+        # ordering of the stored run (new_run fills them from the same plan
+        # already, but align them defensively for reconstructed old plans).
+        rebuilt["plan"] = copy.deepcopy(plan)
+        rebuilt["step_order"] = list(plan["order"])
+        rebuilt["order_index"] = {sid: i for i, sid in enumerate(plan["order"])}
         steps = rebuilt["steps"]
         for event in stored["history"]:
             sid, etype, at = event.get("step_id"), event.get("type"), event.get("at")
             attempt = event.get("attempt")
             if sid is None:
-                if etype == "run_succeeded":
-                    rebuilt["status"] = RUN_SUCCEEDED
-                elif etype == "run_failed":
-                    rebuilt["status"] = RUN_FAILED
-                elif etype == "run_started" and rebuilt["status"] == RUN_PENDING:
-                    rebuilt["status"] = RUN_RUNNING
+                # Run-level markers (run_created, run_started, run_succeeded,
+                # run_failed) need no replay action: the run status is derived
+                # from the rebuilt nodes at the end, exactly as every live
+                # transition derives it before persisting.
                 continue
             step = steps.get(sid)
             if step is None:
+                # The frozen definition has no node for this event: a node
+                # introduced by a later same-name workflow must not appear
+                # here, and old events can never reference a removed node.
                 continue
             if etype == "ready":
                 step.update(status=STEP_READY, ready_at=at)
@@ -1099,14 +1130,22 @@ class Scheduler:
             elif etype == "heartbeat":
                 step["lease_deadline"] = event.get("lease_deadline")
             elif etype == "takeover":
-                step.update(status=STEP_READY, worker_id=None, lease_deadline=None)
+                # Mirrors _expire_leases: the node is re-queued with a fresh
+                # ready_at and no holder; started_at from the lost lease is
+                # left in place, exactly as the live transition leaves it.
+                step.update(status=STEP_READY, worker_id=None, lease_deadline=None,
+                            ready_at=at)
             elif etype == "complete":
-                step.update(status=STEP_SUCCEEDED, result=event.get("result"), finished_at=at,
-                            lease_deadline=None, worker_id=None,
+                # Mirrors complete(): the successful node keeps the worker
+                # that completed it and clears any prior failure error.
+                step.update(status=STEP_SUCCEEDED, result=event.get("result"), error=None,
+                            finished_at=at, lease_deadline=None,
+                            worker_id=event.get("worker_id"),
                             attempt=step["attempt"] if attempt is None else attempt)
             elif etype == "decision":
-                step.update(status=STEP_SUCCEEDED if event.get("decision") == "approve"
-                            else STEP_FAILED, finished_at=at,
+                approved = event.get("decision") == "approve"
+                step.update(status=STEP_SUCCEEDED if approved else STEP_FAILED,
+                            finished_at=at,
                             approval={"actor": event.get("actor"),
                                       "decision": event.get("decision"), "at": at})
             elif etype == "fail":
@@ -1117,8 +1156,12 @@ class Scheduler:
                             next_attempt_at=event.get("next_attempt_at"))
             elif etype == "attempts_exhausted":
                 step.update(status=STEP_FAILED, finished_at=at, next_attempt_at=None)
-        if all(s["status"] == STEP_SUCCEEDED for s in steps.values()):
-            rebuilt["status"] = RUN_SUCCEEDED
-        elif any(s["status"] == STEP_FAILED for s in steps.values()):
-            rebuilt["status"] = RUN_FAILED
+        # Every live write path derives the run status from its nodes, so
+        # rebuilding from the same nodes yields the same status — including
+        # the pending/running boundary (a run with only ready/waiting nodes
+        # and no claim is still pending; a retry-queued run has returned to
+        # pending even though a run_started event exists).
+        rebuilt["status"] = _derive_run_status(rebuilt)
+        rebuilt["updated_at"] = stored.get("updated_at")
+        rebuilt["history"] = copy.deepcopy(stored["history"])
         return rebuilt

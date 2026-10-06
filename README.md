@@ -428,8 +428,28 @@ Every transition appends `{"at","run_id","step_id","type","attempt","worker_id"}
 to the run's append-only history (a `decision` event additionally carries
 `actor` and `decision`; `claim` and `heartbeat` events carry the
 `lease_deadline`; a `retry` event carries the scheduled `next_attempt_at`);
-`Scheduler.replay(run_id)` rebuilds the current
-states from that history and agrees with the stored document.
+`Scheduler.replay(tenant, run_id)` rebuilds the current states from that
+history and agrees with the stored document on every observable field.
+
+### Workflow versions and same-name submissions
+
+The normalized DAG definition used when a run is created — step order, node
+`kind`, dependencies and `max_attempts` — is snapshotted into the run
+document (`plan`) at creation time and never changes afterwards. Submitting
+another workflow under the same `workflow_id` in the same tenant only
+governs runs created after that submission; it cannot rewrite an existing
+run's nodes, order, kinds, dependencies, retry limits or state machine.
+
+`Scheduler.replay` rebuilds a run exclusively from its frozen definition
+plus the append-only history, never from the workflow currently registered
+under the run's `workflow_id`: a later same-name submission can neither
+drop old nodes, introduce new ones nor change which dependencies unlock a
+node, and replay even works after the registered workflow is deleted.
+Documents written before snapshots existed reconstruct the frozen plan from
+the node definitions and `step_order` stored in the run document itself.
+Replay is idempotent and deterministic — replaying twice or after a restart
+returns the identical document — and unknown run ids / cross-tenant reads
+still return `unknown_run` / `cross_tenant`.
 
 ## Layout
 

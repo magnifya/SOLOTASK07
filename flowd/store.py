@@ -250,7 +250,11 @@ def normalize_run(run):
     (``None``).  Runs without ``schedule_id``/``scheduled_at`` predate
     periodic scheduling and were created manually (``None``).  Steps without
     ``next_attempt_at`` predate retry backoff and are immediately claimable
-    (``None``).  Mutates and returns ``run``.
+    (``None``).  Runs without a frozen ``plan`` predate per-run DAG snapshots
+    and reconstruct theirs from the node definitions and ``step_order`` saved
+    in the run document itself, so replay never has to read the workflow
+    registry (which a later same-name submission may have overwritten).
+    Mutates and returns ``run``.
     """
     run.setdefault("max_parallelism", None)
     run.setdefault("idempotency_key", None)
@@ -261,7 +265,54 @@ def normalize_run(run):
         step.setdefault("kind", KIND_TASK)
         step.setdefault("approval", None)
         step.setdefault("next_attempt_at", None)
+    if not run.get("plan"):
+        run["plan"] = plan_from_run(run)
     return run
+
+
+def plan_from_run(run):
+    """Reconstruct a normalized plan from the definitions frozen in a run.
+
+    The run document keeps each node's ``kind``, ``depends_on`` and
+    ``max_attempts`` together with ``step_order``; those are exactly the
+    fields a plan needs, so documents written before plans were snapshotted
+    remain replayable even after the workflow of the same id is overwritten
+    or deleted.
+    """
+    steps = run.get("steps") or {}
+    order = [sid for sid in (run.get("step_order") or sorted(steps)) if sid in steps]
+    ordered = [
+        {
+            "id": steps[sid]["id"],
+            "depends_on": list(steps[sid].get("depends_on") or []),
+            "max_attempts": steps[sid]["max_attempts"],
+            "kind": steps[sid].get("kind", KIND_TASK),
+        }
+        for sid in order
+    ]
+    return {
+        "workflow_id": run.get("workflow_id"),
+        "steps": ordered,
+        "order": [step["id"] for step in ordered],
+    }
+
+
+def run_plan(run):
+    """Return the normalized DAG plan frozen into ``run`` at creation.
+
+    Newer documents carry an explicit snapshot under ``plan``; older ones
+    reconstruct it via :func:`plan_from_run` from the run's own nodes and
+    ordering.  The result is a fresh copy, so callers can never mutate the
+    snapshot stored in the run document.
+    """
+    snapshot = run.get("plan")
+    if not snapshot or not snapshot.get("steps"):
+        snapshot = plan_from_run(run)
+    return {
+        "workflow_id": snapshot.get("workflow_id", run.get("workflow_id")),
+        "steps": [dict(step) for step in snapshot.get("steps", [])],
+        "order": list(snapshot.get("order", [])),
+    }
 
 
 def new_run(tenant, workflow_id, run_id, params, plan, now_iso, max_parallelism=None,
@@ -300,6 +351,15 @@ def new_run(tenant, workflow_id, run_id, params, plan, now_iso, max_parallelism=
         "scheduled_at": scheduled_at,
         "created_at": now_iso,
         "updated_at": now_iso,
+        # The normalized DAG as it was when this run was created.  A later
+        # submission of another workflow with the same id must not rewrite
+        # this run's nodes, order, kinds, dependencies or max_attempts;
+        # replay rebuilds exclusively from this snapshot.
+        "plan": {
+            "workflow_id": plan["workflow_id"],
+            "steps": [dict(step) for step in plan["steps"]],
+            "order": list(plan["order"]),
+        },
         "step_order": list(plan["order"]),
         "order_index": {sid: i for i, sid in enumerate(plan["order"])},
         "steps": steps,
