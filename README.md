@@ -84,8 +84,8 @@ stored in `<tenant>/audit.json` and readable via
 
 Run actions reuse the existing history types (`run_created`, `ready`,
 `waiting`, `claim`, `heartbeat`, `takeover`, `complete`, `fail`, `retry`,
-`attempts_exhausted`, `decision`, `cancel`, `run_started`, `run_succeeded`,
-`run_failed`, `run_cancelled`); control-plane operations use fixed `resource.action`
+`attempts_exhausted`, `skipped`, `decision`, `cancel`, `run_started`,
+`run_succeeded`, `run_failed`, `run_cancelled`); control-plane operations use fixed `resource.action`
 identifiers: `workflow.submit`, `worker.register`, `worker.heartbeat`,
 `schedule.create` and `schedule.dispatch`. Records carry only identifiers
 and the actor (the decision maker on `decision` records, the canceller on
@@ -355,6 +355,53 @@ the listing, `flowd status` and `Scheduler.replay`. Runs written by older
 versions read back as `null` and never participate in dedup; unkeyed creates
 keep their existing semantics.
 
+### Trigger rules (`trigger_rule`)
+
+Every step may set an optional `trigger_rule` controlling when its
+dependencies unlock it. Omitting the field (or passing `null`) means
+`all_success` — the legacy rule, so existing definitions are unchanged.
+The accepted values are:
+
+- `all_success` (default): unlock when **every** dependency is
+  `succeeded`.
+- `all_done`: unlock when every dependency reached a terminal state
+  (`succeeded`, `failed`, `cancelled` or `skipped`), regardless of
+  outcome.
+- `any_success`: unlock as soon as **any** one dependency is
+  `succeeded`.
+
+A non-string value, an empty string or any other name is rejected with
+400 (`bad_trigger_rule`): the workflow is neither saved nor overwritten
+and no audit record is written. Root steps (no dependencies) open
+immediately under all three rules. The rule is part of the normalized
+plan, is frozen into the run's `plan` snapshot at creation and is
+reported as `trigger_rule` on every step of the run details; runs
+written by older versions read it back as `all_success`.
+
+Scheduling treats `succeeded`, `failed`, `cancelled` and `skipped` as
+terminal step states. When a dependency fails terminally (retries
+exhausted or approval rejected) or is skipped, pending dependents are
+re-evaluated in topological order: an `all_success` node whose condition
+can never hold again becomes `skipped`, an `any_success` node whose
+dependencies are all terminal without a success becomes `skipped`, and
+each skipped node records exactly one `skipped` history event (which
+also enters the tenant's audit stream). A `skipped` node holds no lease,
+keeps `attempt` 0, is never claimed (`complete`/`fail` against it
+conflict) and cascades to its own dependents in the same pass. When no
+node is executable, `claim` keeps returning `None` / 204.
+
+A run containing at least one non-`all_success` rule stays
+`pending`/`running` while any node can still unlock, execute or wait for
+an approval, and finishes only once **every** node is terminal: it is
+`failed` when any node failed, otherwise `succeeded` (`skipped` nodes
+alone do not fail a run); an explicit cancel still ends it as
+`cancelled`. Runs made entirely of `all_success` steps keep the legacy
+semantics exactly: the run fails the moment a step exhausts its retries
+or an approval is rejected, and surviving successors stay `pending`.
+Run details, `Scheduler.history` and `Scheduler.replay` all present the
+new states and rules consistently, and replay rebuilds them after a
+restart.
+
 ### Approval decisions
 
 `POST /v1/runs/{run_id}/decision` takes `{"tenant","step_id","actor","decision"}`.
@@ -420,7 +467,9 @@ heartbeats and listing append nothing to any run's history and never touch
 ## Step / run state machine
 
 Step states: `pending` -> `ready` -> `running` -> `succeeded` | `failed`;
-approval steps instead go `pending` -> `waiting` -> `succeeded` | `failed`.
+approval steps instead go `pending` -> `waiting` -> `succeeded` | `failed`;
+a `pending` step whose trigger rule (see above) becomes unsatisfiable goes
+straight to `skipped`.
 
 - A step starts `pending` and becomes `ready` only when **all** dependencies are `succeeded`.
   Root steps open immediately at run creation unless the run has a future `not_before`, in

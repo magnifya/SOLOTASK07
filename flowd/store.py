@@ -22,7 +22,7 @@ import time as _time
 import uuid
 from contextlib import contextmanager
 
-from .model import KIND_TASK, WorkflowError, format_time, plan_workflow
+from .model import DEFAULT_TRIGGER_RULE, KIND_TASK, WorkflowError, format_time, plan_workflow
 
 RUN_PENDING = "pending"
 RUN_RUNNING = "running"
@@ -37,8 +37,10 @@ STEP_WAITING = "waiting"
 STEP_SUCCEEDED = "succeeded"
 STEP_FAILED = "failed"
 STEP_CANCELLED = "cancelled"
+STEP_SKIPPED = "skipped"
 
 TERMINAL_RUN_STATES = (RUN_SUCCEEDED, RUN_FAILED, RUN_CANCELLED)
+TERMINAL_STEP_STATES = (STEP_SUCCEEDED, STEP_FAILED, STEP_CANCELLED, STEP_SKIPPED)
 
 
 def atomic_write_json(path, payload):
@@ -265,7 +267,9 @@ def normalize_run(run):
     (``None``).  Runs without ``schedule_id``/``scheduled_at`` predate
     periodic scheduling and were created manually (``None``).  Steps without
     ``next_attempt_at`` predate retry backoff and are immediately claimable
-    (``None``).  Runs without a frozen ``plan`` predate per-run DAG snapshots
+    (``None``).  Steps without ``trigger_rule`` predate trigger rules and
+    follow the legacy all-dependencies-succeeded rule (``all_success``).
+    Runs without a frozen ``plan`` predate per-run DAG snapshots
     and reconstruct theirs from the node definitions and ``step_order`` saved
     in the run document itself, so replay never has to read the workflow
     registry (which a later same-name submission may have overwritten).
@@ -280,6 +284,7 @@ def normalize_run(run):
         step.setdefault("kind", KIND_TASK)
         step.setdefault("approval", None)
         step.setdefault("next_attempt_at", None)
+        step.setdefault("trigger_rule", DEFAULT_TRIGGER_RULE)
     if not run.get("plan"):
         run["plan"] = plan_from_run(run)
     return run
@@ -302,6 +307,7 @@ def plan_from_run(run):
             "depends_on": list(steps[sid].get("depends_on") or []),
             "max_attempts": steps[sid]["max_attempts"],
             "kind": steps[sid].get("kind", KIND_TASK),
+            "trigger_rule": steps[sid].get("trigger_rule", DEFAULT_TRIGGER_RULE),
         }
         for sid in order
     ]
@@ -337,6 +343,7 @@ def new_run(tenant, workflow_id, run_id, params, plan, now_iso, max_parallelism=
         step["id"]: {
             "id": step["id"],
             "kind": step.get("kind", KIND_TASK),
+            "trigger_rule": step.get("trigger_rule", DEFAULT_TRIGGER_RULE),
             "depends_on": list(step["depends_on"]),
             "max_attempts": step["max_attempts"],
             "status": STEP_PENDING,

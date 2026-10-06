@@ -317,6 +317,7 @@ def _step_view(step):
     return {"id": step["id"], "kind": step.get("kind", "task"), "status": step["status"],
             "attempt": step["attempt"],
             "max_attempts": step["max_attempts"], "depends_on": list(step["depends_on"]),
+            "trigger_rule": step.get("trigger_rule", "all_success"),
             "worker_id": step["worker_id"], "lease_deadline": step["lease_deadline"],
             "next_attempt_at": step["next_attempt_at"], "result": step.get("result"),
             "error": step.get("error"), "approval": step.get("approval")}
