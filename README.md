@@ -11,6 +11,7 @@ Data lives in a single directory: `<root>/<tenant>/workflows.json`,
 `<root>/<tenant>/idempotency.json` (idempotency-key → run bindings),
 `<root>/<tenant>/workers.json` (worker registrations),
 `<root>/<tenant>/schedules.json` (periodic schedules),
+`<root>/<tenant>/quota.json` (the tenant-wide concurrency quota),
 `<root>/<tenant>/audit.json` (the tenant's audit stream) plus
 `<root>/<tenant>/runs/<run_id>.json`, written atomically, so restarting the
 process sees exactly the same state.
@@ -64,6 +65,8 @@ the only accepted values are `task` and `approval`.
 | GET | `/v1/workers?tenant=` | 200 `{"tenant":...,"items":[...]}` sorted by worker_id | 400 missing tenant |
 | POST | `/v1/schedules` | 201 schedule record with `next_at` | 400 bad_tenant/bad_schedule_id/bad_interval/bad_first_at/bad_params/bad_max_parallelism/bad JSON, 404 unknown workflow, 409 schedule_exists |
 | GET | `/v1/schedules?tenant=` | 200 `{"tenant":...,"items":[...]}` sorted by schedule_id | 400 missing tenant |
+| POST | `/v1/quotas` | 201 first write, 200 update `{"tenant":...,"max_parallelism":...,"updated_at":...}` | 400 bad_json/bad_tenant/bad_max_parallelism |
+| GET | `/v1/quotas?tenant=` | 200 quota record (`max_parallelism: null` when unconfigured) | 400 missing/blank tenant |
 | POST | `/v1/schedules/{schedule_id}/dispatch` | 201 scheduled run, 204 not due yet | 400 bad_tenant/bad_schedule_id/bad JSON, 403 cross-tenant, 404 unknown schedule |
 | GET | `/v1/runs?tenant=&status=&limit=&after=` | 200 `{"items":[...],"next_after":...}` | 400 missing tenant |
 | GET | `/v1/audit?tenant=&action=&run_id=&limit=&after=` | 200 `{"tenant":...,"items":[...],"next_after":...}` | 400 bad_tenant/bad_action/bad_run_id/bad_limit/bad_after |
@@ -87,7 +90,7 @@ Run actions reuse the existing history types (`run_created`, `ready`,
 `attempts_exhausted`, `decision`, `cancel`, `run_started`, `run_succeeded`,
 `run_failed`, `run_cancelled`); control-plane operations use fixed `resource.action`
 identifiers: `workflow.submit`, `worker.register`, `worker.heartbeat`,
-`schedule.create` and `schedule.dispatch`. Records carry only identifiers
+`schedule.create`, `schedule.dispatch` and `quota.set`. Records carry only identifiers
 and the actor (the decision maker on `decision` records, the canceller on
 `cancel`/`run_cancelled` records, `null` elsewhere)
 — never params, results or error text; identifiers that do not apply are
@@ -179,6 +182,37 @@ takes or releases a slot. When the quota is full, `Scheduler.claim` returns
 JSON: ready tasks stay ready and no claim history is appended (takeover
 entries from leases reclaimed by the same call are still recorded). Quotas
 are counted per `run_id`, so runs and tenants never share slots.
+
+### Tenant concurrency quota
+
+`POST /v1/quotas` (and `Scheduler.set_quota`) configure one optional
+tenant-wide concurrency budget, persisted in `<tenant>/quota.json` and
+readable via `GET /v1/quotas?tenant=` (or `Scheduler.get_quota`). The body
+must be a JSON object (`bad_json` otherwise); `tenant` must be a non-empty
+string after trimming (`bad_tenant`); `max_parallelism` may be omitted or
+`null` for unlimited, otherwise only a positive integer is accepted —
+booleans, floats, strings, zero and negatives are rejected with
+`bad_max_parallelism`. The first write returns 201, later updates 200; both
+echo the normalized `tenant`, the current `max_parallelism` and
+`updated_at`. A same-value update changes nothing: `updated_at` is kept and
+no audit record is appended, while every actual change appends one
+`quota.set` record to the tenant's audit stream. Validation failures and
+read-only queries append nothing. An unconfigured tenant reads back 200 with
+`max_parallelism: null` and keeps the legacy per-run behavior exactly.
+
+Once a quota is set, every single-run claim and every fair
+`POST /v1/tasks/claim` first reclaims — inside the same store lock — all
+expired ordinary-task leases across **all** of the tenant's runs (the
+takeovers are recorded with the usual history and audit entries and are kept
+even when the claim is refused), then counts the tasks still `running` with
+`lease_deadline` strictly later than now across those runs. Approval nodes
+and ready, waiting, retry-pending, succeeded or failed steps hold no slot.
+When the count reaches the quota the claim returns `None` / HTTP 204 with no
+new claim event; with a free slot the usual run selection, fairness counts,
+topological order and per-run `max_parallelism` apply, and the leased task
+occupies exactly one tenant slot. Lowering the quota never revokes existing
+leases, and slots released by completion, failure, cancellation or takeover
+are immediately reusable.
 
 ### Delayed start (`not_before`)
 

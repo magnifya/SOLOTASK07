@@ -89,6 +89,8 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._list_schedules(query)
             if path == "/v1/workers":
                 return self._list_workers(query)
+            if path == "/v1/quotas":
+                return self._get_quota(query)
             if path == "/v1/audit":
                 # Blank values count as "provided" here: an empty tenant,
                 # action or run_id is a 400, not a missing parameter.
@@ -116,6 +118,8 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._json(201, _run_view(run))
             if path == "/v1/schedules":
                 return self._create_schedule(self._body())
+            if path == "/v1/quotas":
+                return self._set_quota(self._body())
             schedule_dispatch = re.fullmatch(r"/v1/schedules/([^/]+)/dispatch", path)
             if schedule_dispatch:
                 return self._dispatch_schedule(unquote(schedule_dispatch.group(1)), self._body())
@@ -183,6 +187,16 @@ class _Handler(BaseHTTPRequestHandler):
             tenant, action=action, run_id=run_id, limit=limit, after=after)
         return self._json(200, {"tenant": tenant.strip(), "items": items,
                                 "next_after": next_after})
+
+    # -- tenant concurrency quota ---------------------------------------
+    def _set_quota(self, body):
+        record, created = self.scheduler.set_quota(body.get("tenant"),
+                                                   body.get("max_parallelism"))
+        return self._json(201 if created else 200, _quota_view(record))
+
+    def _get_quota(self, query):
+        record = self.scheduler.get_quota((query.get("tenant") or [None])[0])
+        return self._json(200, _quota_view(record))
 
     # -- periodic schedules -------------------------------------------
     def _create_schedule(self, body):
@@ -305,6 +319,11 @@ def _step_view(step):
             "worker_id": step["worker_id"], "lease_deadline": step["lease_deadline"],
             "next_attempt_at": step["next_attempt_at"], "result": step.get("result"),
             "error": step.get("error"), "approval": step.get("approval")}
+
+
+def _quota_view(record):
+    return {"tenant": record["tenant"], "max_parallelism": record.get("max_parallelism"),
+            "updated_at": record.get("updated_at")}
 
 
 def _schedule_view(record):
