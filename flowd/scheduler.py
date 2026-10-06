@@ -11,10 +11,12 @@ import time as _time
 
 from .model import KIND_APPROVAL, KIND_TASK, WorkflowError, format_time
 from .store import (
+    RUN_CANCELLED,
     RUN_FAILED,
     RUN_PENDING,
     RUN_RUNNING,
     RUN_SUCCEEDED,
+    STEP_CANCELLED,
     STEP_FAILED,
     STEP_PENDING,
     STEP_READY,
@@ -306,6 +308,8 @@ def _derive_run_status(run):
     steps = list(run["steps"].values())
     if any(s["status"] == STEP_FAILED for s in steps):
         return RUN_FAILED
+    if any(s["status"] == STEP_CANCELLED for s in steps):
+        return RUN_CANCELLED
     if steps and all(s["status"] == STEP_SUCCEEDED for s in steps):
         return RUN_SUCCEEDED
     if any(s["status"] in (STEP_RUNNING, STEP_SUCCEEDED) for s in steps):
@@ -911,6 +915,8 @@ class Scheduler:
             if owner is not None and owner != tenant:
                 raise WorkflowError("run %s belongs to another tenant" % run_id, "cross_tenant")
             run = self.get_run(tenant, run_id)
+            if run["status"] == RUN_CANCELLED:
+                raise ConflictError("run %s is cancelled" % run_id, "run_cancelled")
             if run["status"] in (RUN_SUCCEEDED, RUN_FAILED):
                 raise ConflictError("run %s is already %s" % (run_id, run["status"]),
                                     "run_finished")
@@ -951,6 +957,8 @@ class Scheduler:
         now = self.now()
         with self.store.locked():
             run = self.get_run(tenant, run_id)
+            if run["status"] == RUN_CANCELLED:
+                raise ConflictError("run %s is cancelled" % run_id, "run_cancelled")
             step = run["steps"].get(step_id)
             if step is None:
                 raise WorkflowError("unknown step: %s" % step_id, "unknown_step")
@@ -980,6 +988,8 @@ class Scheduler:
         now = self.now()
         with self.store.locked():
             run = self.get_run(tenant, run_id)
+            if run["status"] == RUN_CANCELLED:
+                raise ConflictError("run %s is cancelled" % run_id, "run_cancelled")
             step = run["steps"].get(step_id)
             if step is None:
                 raise WorkflowError("unknown step: %s" % step_id, "unknown_step")
@@ -1023,6 +1033,8 @@ class Scheduler:
             raise WorkflowError("decision must be 'approve' or 'reject'", "bad_decision")
         with self.store.locked():
             run = self.get_run(tenant, run_id)
+            if run["status"] == RUN_CANCELLED:
+                raise ConflictError("run %s is cancelled" % run_id, "run_cancelled")
             step = run["steps"].get(step_id)
             if step is None:
                 raise WorkflowError("unknown step: %s" % step_id, "unknown_step")
@@ -1060,6 +1072,62 @@ class Scheduler:
             elif run["status"] == RUN_FAILED:
                 self._event(run, run_id, None, "run_failed")
             run["updated_at"] = at
+            self.store.save_run(run)
+            return run
+
+    # -- cancellation ---------------------------------------------------
+    def cancel(self, tenant, run_id, actor):
+        """Cancel an unfinished run and every non-terminal node in it.
+
+        ``tenant`` and ``actor`` must be non-empty strings after trimming
+        (``bad_tenant`` / ``bad_actor``).  An unknown run raises
+        ``unknown_run`` (404) and a run owned by another tenant raises
+        ``cross_tenant`` (403).  A run that already reached a succeeded or
+        failed state conflicts with ``run_finished`` (409); repeating a
+        cancel on an already cancelled run returns the current document
+        unchanged — no new history, audit records or ``updated_at``.
+
+        The first cancel moves every non-terminal node (``pending``,
+        ``ready``, ``running``, ``waiting``) to ``cancelled`` in
+        ``step_order``, keeping ``attempt``, ``result`` and ``error`` while
+        clearing ``worker_id``, ``lease_deadline`` and ``next_attempt_at``;
+        succeeded nodes are left untouched.  Each cancelled node records a
+        ``cancel`` event carrying the previous lease holder and the actor,
+        and a final run-level ``run_cancelled`` event closes the history.
+        A sleeping run (a future ``not_before``) is cancelled without
+        opening its root nodes.  Nothing is deleted: the run file, the
+        workflow, idempotency bindings and the history all stay in place.
+        """
+        tenant = normalize_tenant(tenant)
+        if not isinstance(actor, str) or not actor.strip():
+            raise WorkflowError("actor must be a non-empty string", "bad_actor")
+        actor = actor.strip()
+        with self.store.locked():
+            owner = self.store.run_exists(run_id)
+            if owner is None:
+                raise WorkflowError("unknown run: %s" % run_id, "unknown_run")
+            if owner != tenant:
+                raise WorkflowError("run %s belongs to another tenant" % run_id, "cross_tenant")
+            run = self.store.load_run(tenant, run_id)
+            if run["status"] in (RUN_SUCCEEDED, RUN_FAILED):
+                raise ConflictError("run %s is already %s" % (run_id, run["status"]),
+                                    "run_finished")
+            if run["status"] == RUN_CANCELLED:
+                # Repeat cancel: return the stored document untouched.
+                return run
+            index = run["order_index"]
+            for sid in sorted(run["steps"], key=lambda s: index.get(s, 0)):
+                step = run["steps"][sid]
+                if step["status"] in (STEP_SUCCEEDED, STEP_FAILED):
+                    continue
+                holder = step.get("worker_id")
+                step.update(status=STEP_CANCELLED, worker_id=None, lease_deadline=None,
+                            next_attempt_at=None)
+                self._event(run, run_id, sid, "cancel", attempt=step["attempt"],
+                            worker_id=holder, actor=actor)
+            self._event(run, run_id, None, "run_cancelled", actor=actor)
+            run["status"] = RUN_CANCELLED
+            run["updated_at"] = self._iso()
             self.store.save_run(run)
             return run
 
@@ -1109,9 +1177,10 @@ class Scheduler:
             attempt = event.get("attempt")
             if sid is None:
                 # Run-level markers (run_created, run_started, run_succeeded,
-                # run_failed) need no replay action: the run status is derived
-                # from the rebuilt nodes at the end, exactly as every live
-                # transition derives it before persisting.
+                # run_failed, run_cancelled) need no replay action: the run
+                # status is derived from the rebuilt nodes at the end,
+                # exactly as every live transition derives it before
+                # persisting.
                 continue
             step = steps.get(sid)
             if step is None:
@@ -1156,6 +1225,11 @@ class Scheduler:
                             next_attempt_at=event.get("next_attempt_at"))
             elif etype == "attempts_exhausted":
                 step.update(status=STEP_FAILED, finished_at=at, next_attempt_at=None)
+            elif etype == "cancel":
+                # Mirrors cancel(): the node keeps its attempt, result, error
+                # and timestamps; only the lease fields are cleared.
+                step.update(status=STEP_CANCELLED, worker_id=None, lease_deadline=None,
+                            next_attempt_at=None)
         # Every live write path derives the run status from its nodes, so
         # rebuilding from the same nodes yields the same status — including
         # the pending/running boundary (a run with only ready/waiting nodes

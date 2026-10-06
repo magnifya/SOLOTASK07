@@ -13,8 +13,8 @@ order is deterministic.
 import heapq
 import time as _time
 
-STEP_STATES = ("pending", "ready", "running", "waiting", "succeeded", "failed")
-RUN_STATES = ("pending", "running", "succeeded", "failed")
+STEP_STATES = ("pending", "ready", "running", "waiting", "succeeded", "failed", "cancelled")
+RUN_STATES = ("pending", "running", "succeeded", "failed", "cancelled")
 DEFAULT_MAX_ATTEMPTS = 3
 
 KIND_TASK = "task"
