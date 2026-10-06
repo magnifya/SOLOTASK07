@@ -321,6 +321,23 @@ def _roots_opened(run):
     return any(e.get("type") in ("ready", "waiting") for e in run.get("history") or [])
 
 
+def _plan_from_run(run):
+    """Reconstruct the frozen plan a run was created with from its document.
+
+    The run document persists the normalized DAG (topological ``step_order``
+    and, per node, ``kind``/``depends_on``/``max_attempts``) at creation
+    time, so this plan is exactly what :func:`new_run` consumed then —
+    independent of any later re-submission of the same ``workflow_id``.
+    """
+    order = list(run["step_order"])
+    steps = run["steps"]
+    return {
+        "workflow_id": run["workflow_id"],
+        "steps": [steps[sid] for sid in order if sid in steps],
+        "order": order,
+    }
+
+
 class Scheduler:
     """Coordinates workers against a :class:`WorkflowStore`."""
 
@@ -1063,9 +1080,18 @@ class Scheduler:
 
     # -- history / replay ----------------------------------------------
     def replay(self, tenant, run_id):
-        """Rebuild run state from the append-only history."""
+        """Rebuild run state from the append-only history.
+
+        The DAG is the one frozen into the run document at creation time
+        (``step_order`` plus each step's ``kind``/``depends_on``/
+        ``max_attempts``).  Re-submitting the same ``workflow_id`` with a
+        different definition only affects runs created afterwards, so replay
+        must never consult the current workflow plan: it rebuilds exactly
+        the nodes the run was created with, and a restart over the same
+        data directory yields the same result.
+        """
         stored = self.get_run(tenant, run_id)
-        plan = self.store.get_workflow(tenant, stored["workflow_id"])
+        plan = _plan_from_run(stored)
         rebuilt = new_run(tenant, stored["workflow_id"], run_id, stored.get("params"), plan,
                           stored["created_at"],
                           max_parallelism=stored.get("max_parallelism"),
@@ -1099,10 +1125,14 @@ class Scheduler:
             elif etype == "heartbeat":
                 step["lease_deadline"] = event.get("lease_deadline")
             elif etype == "takeover":
-                step.update(status=STEP_READY, worker_id=None, lease_deadline=None)
+                step.update(status=STEP_READY, worker_id=None, lease_deadline=None,
+                            ready_at=at)
             elif etype == "complete":
+                # A completed step keeps its last claimer as worker_id and
+                # clears any earlier failure's error, exactly like the
+                # persisted document.
                 step.update(status=STEP_SUCCEEDED, result=event.get("result"), finished_at=at,
-                            lease_deadline=None, worker_id=None,
+                            lease_deadline=None, error=None,
                             attempt=step["attempt"] if attempt is None else attempt)
             elif etype == "decision":
                 step.update(status=STEP_SUCCEEDED if event.get("decision") == "approve"

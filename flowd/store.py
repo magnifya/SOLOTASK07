@@ -250,7 +250,11 @@ def normalize_run(run):
     (``None``).  Runs without ``schedule_id``/``scheduled_at`` predate
     periodic scheduling and were created manually (``None``).  Steps without
     ``next_attempt_at`` predate retry backoff and are immediately claimable
-    (``None``).  Mutates and returns ``run``.
+    (``None``).  Runs without ``step_order``/``order_index`` predate the
+    frozen per-run DAG; the order is recovered from ``order_index`` when
+    present, else from the stored step mapping, so replay can still rebuild
+    the run from its own document instead of the current workflow.
+    Mutates and returns ``run``.
     """
     run.setdefault("max_parallelism", None)
     run.setdefault("idempotency_key", None)
@@ -261,6 +265,15 @@ def normalize_run(run):
         step.setdefault("kind", KIND_TASK)
         step.setdefault("approval", None)
         step.setdefault("next_attempt_at", None)
+    if not isinstance(run.get("step_order"), list):
+        index = run.get("order_index")
+        if isinstance(index, dict) and index:
+            run["step_order"] = [sid for sid, _ in sorted(index.items(),
+                                                          key=lambda kv: kv[1])]
+        else:
+            run["step_order"] = list(run.get("steps", {}))
+    if not isinstance(run.get("order_index"), dict):
+        run["order_index"] = {sid: i for i, sid in enumerate(run["step_order"])}
     return run
 
 
