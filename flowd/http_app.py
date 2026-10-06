@@ -68,7 +68,10 @@ class _Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
         try:
-            self._route(method, path, parse_qs(parsed.query))
+            # The audit endpoint treats blank query values as present (and
+            # therefore invalid) instead of dropping them like parse_qs does.
+            query = parse_qs(parsed.query, keep_blank_values=(path == "/v1/audit"))
+            self._route(method, path, query)
         except LeaseError as exc:
             self._error(409, exc.message)
         except ConflictError as exc:
@@ -89,6 +92,8 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._list_schedules(query)
             if path == "/v1/workers":
                 return self._list_workers(query)
+            if path == "/v1/audit":
+                return self._get_audit(query)
         elif method == "POST":
             if path == "/v1/tasks/claim":
                 return self._claim_any_task(self._body())
@@ -145,6 +150,23 @@ class _Handler(BaseHTTPRequestHandler):
         )
         return self._json(200, {"tenant": tenant, "items": [_run_view(r) for r in items],
                                 "next_after": next_after})
+
+    # -- audit stream ---------------------------------------------------
+    def _get_audit(self, query):
+        """Tenant-scoped audit tail: 200 {"tenant","items","next_after"}."""
+        tenant = (query.get("tenant") or [None])[0]
+        if not isinstance(tenant, str) or not tenant.strip():
+            raise WorkflowError("tenant is required", "bad_tenant")
+        limit = _query_int(query, "limit", "bad_limit")
+        after = _query_int(query, "after", "bad_after")
+        result = self.scheduler.audit(
+            tenant,
+            action=(query.get("action") or [None])[0],
+            run_id=(query.get("run_id") or [None])[0],
+            limit=100 if limit is None else limit,
+            after=0 if after is None else after,
+        )
+        return self._json(200, result)
 
     # -- periodic schedules -------------------------------------------
     def _create_schedule(self, body):
@@ -247,6 +269,17 @@ class _Handler(BaseHTTPRequestHandler):
             raise WorkflowError("run %s belongs to another tenant" % run_id, "cross_tenant")
         run = self.scheduler.decide(tenant, run_id, fields["step_id"], fields["actor"], decision)
         return self._json(200, _run_view(run))
+
+
+def _query_int(query, name, code):
+    """Parse an optional integer query parameter; ``None`` when absent."""
+    raw = (query.get(name) or [None])[0]
+    if raw is None:
+        return None
+    text = raw.strip()
+    if not re.fullmatch(r"[+-]?\d+", text):
+        raise WorkflowError("%s must be an integer" % name, code)
+    return int(text)
 
 
 def _step_view(step):

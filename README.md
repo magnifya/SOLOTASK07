@@ -11,6 +11,7 @@ Data lives in a single directory: `<root>/<tenant>/workflows.json`,
 `<root>/<tenant>/idempotency.json` (idempotency-key → run bindings),
 `<root>/<tenant>/workers.json` (worker registrations),
 `<root>/<tenant>/schedules.json` (periodic schedules) plus
+`<root>/<tenant>/audit.json` (tenant audit stream) and
 `<root>/<tenant>/runs/<run_id>.json`, written atomically, so restarting the
 process sees exactly the same state.
 
@@ -64,8 +65,37 @@ the only accepted values are `task` and `approval`.
 | GET | `/v1/schedules?tenant=` | 200 `{"tenant":...,"items":[...]}` sorted by schedule_id | 400 missing tenant |
 | POST | `/v1/schedules/{schedule_id}/dispatch` | 201 scheduled run, 204 not due yet | 400 bad_tenant/bad_schedule_id/bad JSON, 403 cross-tenant, 404 unknown schedule |
 | GET | `/v1/runs?tenant=&status=&limit=&after=` | 200 `{"items":[...],"next_after":...}` | 400 missing tenant |
+| GET | `/v1/audit?tenant=&action=&run_id=&limit=&after=` | 200 `{"tenant":...,"items":[...],"next_after":...}` | 400 bad_tenant/bad_limit/bad_after/bad_action/bad_run_id |
 
 Errors are always `{"error": "<message>"}`.
+
+### Audit stream
+
+Every tenant has an append-only audit stream (`<root>/<tenant>/audit.json`)
+recording workflow, run, task, approval, lease, worker and schedule changes.
+Run actions reuse the run's history event types (`run_created`, `ready`,
+`claim`, `takeover`, `complete`, `fail`, `retry`, `decision`, ...); control
+plane operations use fixed `resource.action` names: `workflow.submit`,
+`worker.register`, `worker.heartbeat`, `schedule.create`,
+`schedule.dispatch`. Each record carries a per-tenant increasing `sequence`
+(assigned in commit order, surviving restarts), a UTC `at` timestamp, the
+`tenant`, the relevant identifiers (`run_id`, `step_id`, `workflow_id`,
+`worker_id`, `schedule_id` — `null` when not applicable) and the `actor`;
+params, results and error text are never recorded. Validation failures,
+cross-tenant denials, read-only requests, idempotency-key replays, not-yet-due
+dispatches, non-extending heartbeats and no-change 204s append nothing.
+
+`GET /v1/audit?tenant=...` returns `{"tenant", "items", "next_after"}` with
+items in increasing sequence order. `tenant` is required (`bad_tenant`);
+`limit` defaults to 100 and must be an integer in [1, 1000] (`bad_limit`);
+`after` defaults to 0 and selects records with a greater sequence
+(`bad_after`); `action` and `run_id` are optional non-empty filters
+(`bad_action` / `bad_run_id`). `next_after` is the last record's sequence
+when more records remain, else `null`; a tenant with no matching records
+gets 200 with empty `items`. Reading the stream never changes runs, leases,
+history or `updated_at`, and only the requested tenant's records are
+visible.
+
 
 ### Tenant-wide fair claim
 

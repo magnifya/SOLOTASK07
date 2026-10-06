@@ -341,11 +341,20 @@ class Scheduler:
                  "attempt": attempt, "worker_id": worker_id}
         event.update(extra)
         run["history"].append(event)
+        # Mirror the event into the tenant's audit stream under the history
+        # type as its action; payloads (result/error/decision) stay out.
+        self.store.append_audit(run.get("tenant"), etype, at=event["at"],
+                                run_id=run_id, step_id=step_id, worker_id=worker_id,
+                                actor=extra.get("actor", worker_id))
         return event
 
     # -- workflow / run lifecycle --------------------------------------
     def submit(self, tenant, workflow_id, steps):
-        return self.store.save_workflow(tenant, workflow_id, steps)
+        with self.store.locked():
+            plan = self.store.save_workflow(tenant, workflow_id, steps)
+            self.store.append_audit(tenant, "workflow.submit", at=self._iso(),
+                                    workflow_id=plan["workflow_id"])
+            return plan
 
     def start_run(self, tenant, workflow_id, run_id=None, params=None, max_parallelism=None,
                   idempotency_key=None, not_before=None, schedule_id=None, scheduled_at=None):
@@ -458,6 +467,39 @@ class Scheduler:
                 raise WorkflowError("unknown run: %s" % run_id, "unknown_run")
         return list(self.get_run(tenant, run_id)["history"])
 
+    # -- audit stream ----------------------------------------------------
+    def audit(self, tenant, action=None, run_id=None, limit=100, after=0):
+        """Read the tenant's audit stream: ``{"tenant", "items", "next_after"}``.
+
+        ``limit`` defaults to 100 and must be an integer in [1, 1000];
+        ``after`` defaults to 0 and only records with a greater sequence are
+        returned.  ``action`` and ``run_id`` are optional non-empty-string
+        filters.  Reading is side-effect free: runs, leases, history and
+        ``updated_at`` are never touched, and only the requested tenant's
+        records are visible.
+        """
+        tenant = normalize_tenant(tenant)
+        if limit is None:
+            limit = 100
+        if isinstance(limit, bool) or not isinstance(limit, int) \
+                or limit < 1 or limit > 1000:
+            raise WorkflowError("limit must be an integer between 1 and 1000", "bad_limit")
+        if after is None:
+            after = 0
+        if isinstance(after, bool) or not isinstance(after, int) or after < 0:
+            raise WorkflowError("after must be a non-negative integer", "bad_after")
+        if action is not None:
+            if not isinstance(action, str) or not action.strip():
+                raise WorkflowError("action must be a non-empty string", "bad_action")
+            action = action.strip()
+        if run_id is not None:
+            if not isinstance(run_id, str) or not run_id.strip():
+                raise WorkflowError("run_id must be a non-empty string", "bad_run_id")
+            run_id = run_id.strip()
+        items, next_after = self.store.query_audit(tenant, action=action, run_id=run_id,
+                                                   limit=limit, after=after)
+        return {"tenant": tenant, "items": items, "next_after": next_after}
+
     # -- periodic schedules -------------------------------------------
     def create_schedule(self, tenant, schedule_id, workflow_id, interval_seconds,
                         first_at=None, params=None, max_parallelism=None):
@@ -496,6 +538,8 @@ class Scheduler:
             }
             schedules[schedule_id] = record
             self.store.save_schedules(tenant, schedules)
+            self.store.append_audit(tenant, "schedule.create", at=self._iso(now),
+                                    schedule_id=schedule_id)
             return dict(record)
 
     def list_schedules(self, tenant):
@@ -545,6 +589,8 @@ class Scheduler:
             record["updated_at"] = self._iso(now)
             schedules[schedule_id] = record
             self.store.save_schedules(tenant, schedules)
+            self.store.append_audit(tenant, "schedule.dispatch", at=self._iso(now),
+                                    schedule_id=schedule_id, run_id=run["run_id"])
             return run, scheduled_at
 
     # -- worker registry -----------------------------------------------
@@ -595,6 +641,7 @@ class Scheduler:
                 created = False
             workers[worker_id] = record
             self.store.save_workers(tenant, workers)
+            self.store.append_audit(tenant, "worker.register", at=at, worker_id=worker_id)
             return self._worker_view(record, now), created
 
     def heartbeat_worker(self, tenant, worker_id, lease_seconds=None):
@@ -621,11 +668,16 @@ class Scheduler:
                     "worker_expired",
                 )
             deadline = max(float(record["expires_at_epoch"]), now + lease)
+            extended = deadline > float(record["expires_at_epoch"])
             record = dict(record)
             record.update(last_heartbeat=self._iso(now), expires_at=self._iso(deadline),
                           expires_at_epoch=deadline)
             workers[worker_id] = record
             self.store.save_workers(tenant, workers)
+            if extended:
+                # A heartbeat that does not extend the lease is not audited.
+                self.store.append_audit(tenant, "worker.heartbeat", at=self._iso(now),
+                                        worker_id=worker_id)
             return self._worker_view(record, now)
 
     def list_workers(self, tenant):

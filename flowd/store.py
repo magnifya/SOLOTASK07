@@ -6,6 +6,7 @@ Layout::
     <root>/<tenant>/idempotency.json
     <root>/<tenant>/workers.json
     <root>/<tenant>/schedules.json
+    <root>/<tenant>/audit.json
     <root>/<tenant>/runs/<run_id>.json
 
 Every write is atomic (temp file + ``os.replace``) so a crash cannot leave a
@@ -96,6 +97,9 @@ class WorkflowStore:
     def schedules_path(self, tenant):
         return os.path.join(self.tenant_dir(tenant), "schedules.json")
 
+    def audit_path(self, tenant):
+        return os.path.join(self.tenant_dir(tenant), "audit.json")
+
     def run_path(self, tenant, run_id):
         return os.path.join(self.tenant_dir(tenant), "runs", "%s.json" % run_id)
 
@@ -153,6 +157,76 @@ class WorkflowStore:
             if schedule_id in (read_json(self.schedules_path(tenant), {}) or {}):
                 return tenant
         return None
+
+    # -- audit stream ---------------------------------------------------
+    def load_audit(self, tenant):
+        """Return the tenant's audit stream as ``{"next": int, "records": [...]}``.
+
+        ``next`` is the sequence number the next appended record will get;
+        it is persisted alongside the records so a restart keeps assigning
+        strictly increasing numbers.  A missing or malformed file reads as
+        an empty stream.  Never writes.
+        """
+        data = read_json(self.audit_path(tenant), None)
+        if not isinstance(data, dict):
+            return {"next": 1, "records": []}
+        records = data.get("records")
+        if not isinstance(records, list):
+            records = []
+        nxt = data.get("next")
+        if not isinstance(nxt, int) or isinstance(nxt, bool) or nxt < 1:
+            nxt = (records[-1].get("sequence", 0) + 1) if records else 1
+        return {"next": nxt, "records": records}
+
+    def append_audit(self, tenant, action, at=None, run_id=None, step_id=None,
+                     workflow_id=None, worker_id=None, schedule_id=None, actor=None):
+        """Append one record to the tenant's audit stream and return it.
+
+        The sequence number is assigned under the store lock, so concurrent
+        appends stay unique and commit order is preserved.  Identifiers that
+        do not apply to the action are stored as ``None``; payloads (params,
+        results, error text) are never recorded.
+        """
+        with self._lock:
+            data = self.load_audit(tenant)
+            record = {
+                "sequence": data["next"],
+                "at": at if at is not None else self.now_iso(),
+                "tenant": tenant,
+                "action": action,
+                "run_id": run_id,
+                "step_id": step_id,
+                "workflow_id": workflow_id,
+                "worker_id": worker_id,
+                "schedule_id": schedule_id,
+                "actor": actor,
+            }
+            data["records"].append(record)
+            data["next"] = data["next"] + 1
+            atomic_write_json(self.audit_path(tenant), data)
+            return record
+
+    def query_audit(self, tenant, action=None, run_id=None, limit=100, after=0):
+        """Read the tenant's audit stream; never mutates any state.
+
+        Returns ``(page, next_after)`` where ``page`` holds up to ``limit``
+        records with ``sequence > after`` (optionally filtered by ``action``
+        and/or ``run_id``) in increasing sequence order, and ``next_after``
+        is the sequence of the page's last record when further records
+        remain, else ``None``.
+        """
+        data = self.load_audit(tenant)
+        records = [
+            record for record in data["records"]
+            if (action is None or record.get("action") == action)
+            and (run_id is None or record.get("run_id") == run_id)
+            and record.get("sequence", 0) > after
+        ]
+        records.sort(key=lambda record: record.get("sequence", 0))
+        limit = max(1, int(limit))
+        page = [dict(record) for record in records[:limit]]
+        next_after = page[-1]["sequence"] if page and len(records) > len(page) else None
+        return page, next_after
 
     # -- runs ----------------------------------------------------------
     def save_run(self, run):
