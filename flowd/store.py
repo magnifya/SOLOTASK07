@@ -6,6 +6,7 @@ Layout::
     <root>/<tenant>/idempotency.json
     <root>/<tenant>/workers.json
     <root>/<tenant>/schedules.json
+    <root>/<tenant>/quota.json
     <root>/<tenant>/audit.json
     <root>/<tenant>/runs/<run_id>.json
 
@@ -99,6 +100,9 @@ class WorkflowStore:
     def schedules_path(self, tenant):
         return os.path.join(self.tenant_dir(tenant), "schedules.json")
 
+    def quota_path(self, tenant):
+        return os.path.join(self.tenant_dir(tenant), "quota.json")
+
     def audit_path(self, tenant):
         return os.path.join(self.tenant_dir(tenant), "audit.json")
 
@@ -159,6 +163,15 @@ class WorkflowStore:
             if schedule_id in (read_json(self.schedules_path(tenant), {}) or {}):
                 return tenant
         return None
+
+    # -- tenant concurrency quota ---------------------------------------
+    def load_quota(self, tenant):
+        """Return the tenant's quota record, or ``None`` when unconfigured."""
+        return read_json(self.quota_path(tenant), None)
+
+    def save_quota(self, tenant, record):
+        atomic_write_json(self.quota_path(tenant), record)
+        return record
 
     # -- audit stream ---------------------------------------------------
     def append_audit(self, tenant, action, at=None, run_id=None, step_id=None,

@@ -178,7 +178,41 @@ takes or releases a slot. When the quota is full, `Scheduler.claim` returns
 `None`, HTTP claim returns 204 and the CLI prints its existing `step: null`
 JSON: ready tasks stay ready and no claim history is appended (takeover
 entries from leases reclaimed by the same call are still recorded). Quotas
-are counted per `run_id`, so runs and tenants never share slots.
+are counted per `run_id`; tenants can additionally share one budget across
+all of their runs via the tenant quota below.
+
+### Tenant concurrency quota
+
+`POST /v1/quotas` creates or updates the calling tenant's concurrency quota
+and `GET /v1/quotas?tenant=` reads it back. The body must be a JSON object
+(`bad_json` otherwise); `tenant` must be a string that is non-empty after
+trimming (`bad_tenant`); `max_parallelism` may be omitted or `null` for
+unlimited, otherwise it must be a positive integer — booleans, floats,
+strings and non-positive integers are rejected (`bad_max_parallelism`). The
+first write returns 201 and later updates 200; both responses carry the
+normalized `tenant`, the current `max_parallelism` and `updated_at`.
+Rewriting the same value changes nothing (same `updated_at`, no audit
+record); a real change appends one `quota.set` record to the tenant's audit
+stream. Validation failures and read-only queries append nothing. Reading
+an unconfigured tenant returns 200 with `max_parallelism: null`; each
+tenant only ever sees the record stored under its own name, and the record
+survives a restart.
+
+Once a quota is configured, every single-run claim and every fair claim
+(`POST /v1/tasks/claim`) shares one active-lease budget across all of the
+tenant's runs. Under the same store lock the claim first reclaims every
+expired ordinary-task lease of the tenant (recording the usual `takeover`
+history and audit entries), then counts ordinary tasks that are `running`
+with `lease_deadline` strictly later than now — approval nodes and ready,
+pending-retry, succeeded or failed steps hold no slot. A full budget
+returns the usual `None` / HTTP 204: no claim event is appended, but
+takeovers recorded by this call's reclaim are kept. With capacity free, the
+existing run selection, fairness counts, topological order and per-run
+`max_parallelism` all apply unchanged, and a successful lease occupies
+exactly one slot. Lowering the quota never revokes existing leases; slots
+freed by completion, failure, cancellation or takeover are immediately
+reusable, and concurrent claims are serialized by the store lock. Tenants
+without a configured quota keep the previous behavior exactly.
 
 ### Delayed start (`not_before`)
 

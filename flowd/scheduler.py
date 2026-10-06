@@ -467,6 +467,61 @@ class Scheduler:
     def list_runs(self, tenant, status=None, limit=50, after=None):
         return self.store.list_runs(tenant, status=status, limit=limit, after=after)
 
+    # -- tenant concurrency quota ---------------------------------------
+    def set_quota(self, tenant, max_parallelism=None):
+        """Create or update the tenant's concurrency quota.
+
+        ``max_parallelism`` omitted or ``None`` means unlimited; otherwise it
+        must be a positive integer.  Returns ``(record, created)`` where
+        ``created`` is ``True`` for the first write (HTTP 201) and ``False``
+        for a later update (HTTP 200).  Rewriting the same value changes
+        nothing: ``updated_at`` is kept and no audit record is appended; a
+        real change appends one ``quota.set`` audit record.
+        """
+        tenant = normalize_tenant(tenant)
+        quota = normalize_max_parallelism(max_parallelism)
+        with self.store.locked():
+            existing = self.store.load_quota(tenant)
+            if existing is not None and existing.get("max_parallelism") == quota:
+                return dict(existing), False
+            record = {"tenant": tenant, "max_parallelism": quota,
+                      "updated_at": self._iso()}
+            self.store.save_quota(tenant, record)
+            self.store.append_audit(tenant, "quota.set")
+            return dict(record), existing is None
+
+    def get_quota(self, tenant):
+        """Read the tenant's quota; unconfigured tenants report ``None``.
+
+        Read-only: never writes state and never appends audit records.  A
+        tenant only ever reads the record stored under its own directory.
+        """
+        tenant = normalize_tenant(tenant)
+        with self.store.locked():
+            record = self.store.load_quota(tenant)
+        if record is None:
+            return {"tenant": tenant, "max_parallelism": None, "updated_at": None}
+        return dict(record)
+
+    def _tenant_quota_limit(self, tenant):
+        """The tenant's active lease budget, or ``None`` when unlimited."""
+        record = self.store.load_quota(tenant)
+        if record is None:
+            return None
+        return record.get("max_parallelism")
+
+    def _reclaim_tenant_leases(self, runs, now):
+        """Expire overdue leases in every given run of a tenant.
+
+        Each expired lease records the usual ``takeover`` history event and
+        audit record; every run that changed is persisted immediately.
+        """
+        for run in runs:
+            if self._expire_leases(run, now):
+                run["status"] = _derive_run_status(run)
+                run["updated_at"] = self._iso()
+                self.store.save_run(run)
+
     # -- audit stream ---------------------------------------------------
     def list_audit(self, tenant, action=None, run_id=None, limit=100, after=0):
         """Read the tenant's audit stream; never mutates any state.
@@ -759,6 +814,13 @@ class Scheduler:
         When nothing is leased and no lease takeover or root activation
         happened, the run's state, history and ``updated_at`` are left
         exactly as stored.
+
+        When the tenant has a concurrency quota configured (see
+        :meth:`set_quota`), all of the tenant's runs share one active-lease
+        budget: expired leases across every run are reclaimed first (with
+        the usual ``takeover`` events, kept even when the budget turns out
+        full), and a full budget returns ``None`` without a claim event.
+        Tenants without a configured quota keep the legacy behavior exactly.
         """
         if not isinstance(worker_id, str) or not worker_id.strip():
             raise WorkflowError("worker_id must be a non-empty string", "bad_worker")
@@ -779,7 +841,27 @@ class Scheduler:
             if not_before is not None and float(not_before) > now:
                 # Still sleeping: activation happens only via a due claim.
                 return None
-            reclaimed = self._expire_leases(run, now)
+            tenant_quota = self._tenant_quota_limit(tenant)
+            if tenant_quota is None:
+                reclaimed = self._expire_leases(run, now)
+            else:
+                # A configured tenant quota shares one lease budget across
+                # all of the tenant's runs: reclaim every expired lease of
+                # the tenant under this lock, then count what survives.
+                others = [r for r in self.store.load_all_runs(tenant)
+                          if r["run_id"] != run_id]
+                self._reclaim_tenant_leases(others, now)
+                reclaimed = self._expire_leases(run, now)
+                active = _active_lease_count(run, now) + sum(
+                    _active_lease_count(other, now) for other in others)
+                if active >= tenant_quota:
+                    # Budget exhausted: this call's takeovers are kept, but
+                    # no claim event and no other state change is added.
+                    if reclaimed:
+                        run["status"] = _derive_run_status(run)
+                        run["updated_at"] = self._iso()
+                        self.store.save_run(run)
+                    return None
             opened_ready, opened_waiting = self._open_root_nodes(run)
             now_iso = self._iso()
             candidates = [s for s in run["steps"].values()
@@ -830,6 +912,11 @@ class Scheduler:
         from the append-only history on every call, so restarts, replay and
         concurrent callers (serialized by the store lock) all agree.
         Worker-registration gating matches the single-run claim.
+
+        A configured tenant concurrency quota (see :meth:`set_quota`) adds a
+        shared active-lease budget across all of the tenant's runs: expired
+        leases tenant-wide are reclaimed first (takeovers are kept), and a
+        full budget returns ``None`` before any run is activated or leased.
         """
         tenant = normalize_tenant(tenant)
         worker_id = normalize_worker_id(worker_id)
@@ -838,6 +925,15 @@ class Scheduler:
         with self.store.locked():
             self._check_worker_registration(tenant, worker_id, now)
             runs = self.store.load_all_runs(tenant)
+            tenant_quota = self._tenant_quota_limit(tenant)
+            if tenant_quota is not None:
+                # Shared tenant budget: reclaim every expired lease of the
+                # tenant under this lock, then count the surviving active
+                # leases.  A full budget returns nothing; the takeovers
+                # recorded by the reclaim are kept.
+                self._reclaim_tenant_leases(runs, now)
+                if sum(_active_lease_count(run, now) for run in runs) >= tenant_quota:
+                    return None
             # Activate due sleeping runs in run_id order; already-activated
             # runs are left untouched.  Terminal runs (including a cancelled
             # run whose roots were never opened) are never activated.
