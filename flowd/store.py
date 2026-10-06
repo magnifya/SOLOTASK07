@@ -27,6 +27,7 @@ RUN_PENDING = "pending"
 RUN_RUNNING = "running"
 RUN_SUCCEEDED = "succeeded"
 RUN_FAILED = "failed"
+RUN_CANCELLED = "cancelled"
 
 STEP_PENDING = "pending"
 STEP_READY = "ready"
@@ -34,8 +35,9 @@ STEP_RUNNING = "running"
 STEP_WAITING = "waiting"
 STEP_SUCCEEDED = "succeeded"
 STEP_FAILED = "failed"
+STEP_CANCELLED = "cancelled"
 
-TERMINAL_RUN_STATES = (RUN_SUCCEEDED, RUN_FAILED)
+TERMINAL_RUN_STATES = (RUN_SUCCEEDED, RUN_FAILED, RUN_CANCELLED)
 
 
 def atomic_write_json(path, payload):

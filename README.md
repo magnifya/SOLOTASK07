@@ -58,6 +58,7 @@ the only accepted values are `task` and `approval`.
 | POST | `/v1/runs/{run_id}/fail` | 200 updated run | 400 bad request, 403, 404 unknown step, 409 lease not held/expired |
 | POST | `/v1/runs/{run_id}/decision` | 200 updated run | 400 bad request/JSON, 403 cross-tenant, 404 unknown run/step, 409 not an approval/not waiting/already decided |
 | POST | `/v1/runs/{run_id}/heartbeat` | 200 updated run | 400 bad request/JSON, 403 cross-tenant, 404 unknown run/step, 409 finished run/approval node/lease not held/expired |
+| POST | `/v1/runs/{run_id}/cancel` | 200 cancelled run (repeat is a no-op) | 400 bad tenant/actor/JSON, 403 cross-tenant, 404 unknown run, 409 run already finished |
 | POST | `/v1/workers/register` | 201 new registration, 200 refreshed registration | 400 bad tenant/worker_id/lease_seconds/JSON |
 | POST | `/v1/workers/{worker_id}/heartbeat` | 200 registration record | 400 bad tenant/lease_seconds/JSON, 404 unknown worker, 409 worker_expired |
 | GET | `/v1/workers?tenant=` | 200 `{"tenant":...,"items":[...]}` sorted by worker_id | 400 missing tenant |
@@ -83,11 +84,12 @@ stored in `<tenant>/audit.json` and readable via
 
 Run actions reuse the existing history types (`run_created`, `ready`,
 `waiting`, `claim`, `heartbeat`, `takeover`, `complete`, `fail`, `retry`,
-`attempts_exhausted`, `decision`, `run_started`, `run_succeeded`,
-`run_failed`); control-plane operations use fixed `resource.action`
+`attempts_exhausted`, `decision`, `cancel`, `run_started`, `run_succeeded`,
+`run_failed`, `run_cancelled`); control-plane operations use fixed `resource.action`
 identifiers: `workflow.submit`, `worker.register`, `worker.heartbeat`,
 `schedule.create` and `schedule.dispatch`. Records carry only identifiers
-and the actor (the decision maker on `decision` records, `null` elsewhere)
+and the actor (the decision maker on `decision` records, the canceller on
+`cancel`/`run_cancelled` records, `null` elsewhere)
 — never params, results or error text; identifiers that do not apply are
 `null`. When one request causes several changes (e.g. two lease takeovers
 plus a claim), the records enter the stream in the order the changes
