@@ -118,6 +118,43 @@ class FairClaimTest(unittest.TestCase):
         self.assertEqual(self.scheduler.get_run("acme", "r1")["status"], "failed")
         self.assertIsNone(self.claim())
 
+    # -- retry backoff ---------------------------------------------------
+    def test_run_with_only_pending_retry_is_not_a_candidate(self):
+        self.submit()
+        self.submit([{"id": "s", "depends_on": [], "max_attempts": 2}],
+                    workflow_id="flaky")
+        self.start("r2")
+        self.start("r3", workflow_id="flaky")
+        self.scheduler.claim("acme", "r3", "w1")
+        self.scheduler.fail("acme", "r3", "s", "w1", error="boom")
+        # r3's only ready task is a not-yet-due retry: it is skipped and the
+        # fair picks land on r2 without touching r3's history or count.
+        before = self.scheduler.get_run("acme", "r3")
+        self.assertEqual(self.claim()[0], "r2")
+        self.assertEqual(self.claim()[0], "r2")
+        self.assertIsNone(self.claim())
+        self.assertEqual(self.scheduler.get_run("acme", "r3"), before)
+        self.assertEqual(self.history_types("r3").count("claim"), 1)
+        # Once the backoff elapses the retry becomes the fairest candidate.
+        self.clock.advance(1)
+        run_id, step = self.claim()
+        self.assertEqual(run_id, "r3")
+        self.assertEqual((step["id"], step["attempt"]), ("s", 1))
+        self.assertIsNone(step["next_attempt_at"])
+
+    def test_all_runs_backing_off_returns_none(self):
+        self.submit([{"id": "s", "depends_on": [], "max_attempts": 2}],
+                    workflow_id="flaky")
+        self.start("r1", workflow_id="flaky")
+        self.scheduler.claim("acme", "r1", "w1")
+        self.scheduler.fail("acme", "r1", "s", "w1", error="boom")
+        before = self.scheduler.get_run("acme", "r1")
+        self.assertIsNone(self.claim())
+        self.assertEqual(self.scheduler.get_run("acme", "r1"), before)
+        self.clock.advance(1)
+        self.assertEqual(self.claim()[1]["id"], "s")
+
+
     def test_approval_only_run_is_not_a_candidate(self):
         self.submit(APPROVAL, workflow_id="gate-wf")
         self.start("r1", workflow_id="gate-wf")

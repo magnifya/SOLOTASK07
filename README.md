@@ -87,8 +87,9 @@ unregistered workers get 409 `worker_not_registered`, expired ones 409
 The call scans the tenant's runs. First, sleeping runs whose `not_before`
 has come due are activated (root nodes opened, one `ready`/`waiting` event
 each) in `run_id` order. Then, among the candidates — runs that are not
-terminal, not still sleeping, hold at least one `ready` ordinary task
-(approval-only runs never qualify) and have not reached their
+terminal, not still sleeping, hold at least one `ready` ordinary task whose
+retry backoff has elapsed (`next_attempt_at` reached; approval-only runs
+never qualify) and have not reached their
 `max_parallelism` — the winner is chosen by fairness: fewest `claim`
 events in the run's history, then `created_at`, then `run_id`. Expired
 leases are reclaimed with the usual `takeover` events before slots are
@@ -343,10 +344,17 @@ approval steps instead go `pending` -> `waiting` -> `succeeded` | `failed`.
 - An `approval` step becomes `waiting` under the same condition (immediately at
   run creation when it has no dependencies); waiting blocks only its successors.
 - `claim` (worker lease) moves a `ready` task to `running` and sets `lease_deadline`;
-  waiting approvals are never claimed.
+  waiting approvals are never claimed. A `ready` task whose `next_attempt_at`
+  still lies in the future is not leased: `claim` skips it (other due `ready`
+  tasks are still handed out in the usual order) and, when nothing is
+  claimable, returns `None` / 204 without touching the run's state, history
+  or `updated_at`. At exactly `next_attempt_at` the task becomes claimable
+  again and a successful claim clears the field.
 - `complete` moves `running` -> `succeeded` and is idempotent for the same worker.
 - `fail` increments the attempt; while attempts remain the step returns to `ready`
-  with `next_attempt_at = now + base * 2**(attempt-1)` (default base 1s).
+  with `next_attempt_at = now + base * 2**(attempt-1)` (default base 1s), and
+  the `retry` history event carries that `next_attempt_at` so `replay` and
+  restarted schedulers restore the same waiting period.
 - Approval nodes take no lease and no retries (`attempt` stays 0); `complete`
   and `fail` against them return 409. A `decision` of `approve` succeeds the
   node and promotes successors; `reject` fails the node and the whole run.
@@ -371,7 +379,8 @@ Run states: `pending` -> `running` -> `succeeded` | `failed`.
 Every transition appends `{"at","run_id","step_id","type","attempt","worker_id"}`
 to the run's append-only history (a `decision` event additionally carries
 `actor` and `decision`; `claim` and `heartbeat` events carry the
-`lease_deadline`); `Scheduler.replay(run_id)` rebuilds the current
+`lease_deadline`; a `retry` event carries the scheduled `next_attempt_at`);
+`Scheduler.replay(run_id)` rebuilds the current
 states from that history and agrees with the stored document.
 
 ## Layout

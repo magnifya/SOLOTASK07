@@ -210,8 +210,9 @@ def normalize_run(run):
     tenant-scoped idempotency keys and never participate in dedup (``None``).
     Runs without ``not_before`` predate delayed start and begin immediately
     (``None``).  Runs without ``schedule_id``/``scheduled_at`` predate
-    periodic scheduling and were created manually (``None``).  Mutates and
-    returns ``run``.
+    periodic scheduling and were created manually (``None``).  Steps without
+    ``next_attempt_at`` predate retry backoff and are immediately claimable
+    (``None``).  Mutates and returns ``run``.
     """
     run.setdefault("max_parallelism", None)
     run.setdefault("idempotency_key", None)
@@ -221,6 +222,7 @@ def normalize_run(run):
     for step in run.get("steps", {}).values():
         step.setdefault("kind", KIND_TASK)
         step.setdefault("approval", None)
+        step.setdefault("next_attempt_at", None)
     return run
 
 

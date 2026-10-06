@@ -133,6 +133,39 @@ class FairClaimHttpTest(unittest.TestCase):
         status, run = self.call("GET", "/v1/runs/r1?tenant=acme")
         self.assertEqual(run["history_length"], 1)  # still just run_created
 
+    def test_run_with_only_pending_retry_is_skipped(self):
+        self.prepare(run_id="r1", workflow_id="flaky",
+                     steps=[{"id": "s", "depends_on": [], "max_attempts": 2}])
+        self.prepare(run_id="r2", workflow_id="wf2")
+        status, body = self.claim()
+        self.assertEqual((status, body["run_id"]), (200, "r1"))
+        status, body = self.call("POST", "/v1/runs/r1/fail",
+                                 {"tenant": "acme", "step_id": "s", "worker_id": "w1",
+                                  "error": "boom"})
+        self.assertEqual(status, 200)
+        self.assertIsNotNone(body["steps"][0]["next_attempt_at"])
+        # r1's retry is still backing off: the fair claim lands on r2 and
+        # r1's history and updated_at stay untouched.
+        before = self.call("GET", "/v1/runs/r1?tenant=acme")[1]
+        status, body = self.claim()
+        self.assertEqual((status, body["run_id"]), (200, "r2"))
+        after = self.call("GET", "/v1/runs/r1?tenant=acme")[1]
+        self.assertEqual(after["updated_at"], before["updated_at"])
+        self.assertEqual(after["history_length"], before["history_length"])
+        time.sleep(1.1)  # wait out the 1s default backoff
+        status, body = self.claim()
+        self.assertEqual((status, body["run_id"]), (200, "r1"))
+        self.assertEqual((body["step"]["id"], body["step"]["attempt"]), ("s", 1))
+        self.assertIsNone(body["step"]["next_attempt_at"])
+
+    def test_all_runs_backing_off_returns_204(self):
+        self.prepare(run_id="r1", workflow_id="flaky",
+                     steps=[{"id": "s", "depends_on": [], "max_attempts": 2}])
+        self.assertEqual(self.claim()[0], 200)
+        self.call("POST", "/v1/runs/r1/fail",
+                  {"tenant": "acme", "step_id": "s", "worker_id": "w1", "error": "boom"})
+        self.assertEqual(self.claim(), (204, None))
+
     # -- worker registry gate ---------------------------------------------
     def test_worker_registration_gate(self):
         self.prepare()

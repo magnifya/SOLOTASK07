@@ -248,6 +248,18 @@ def params_equal(left, right):
     return left == right
 
 
+def _retry_due(step, now_iso):
+    """Whether a ready step's backoff has elapsed (or it never failed).
+
+    ``next_attempt_at`` is set when a failure re-queues the step with
+    remaining attempts; the step becomes claimable again only once the
+    current time reaches that moment.  Both timestamps come from
+    :func:`format_time`, so lexicographic comparison is chronological.
+    """
+    next_attempt_at = step.get("next_attempt_at")
+    return next_attempt_at is None or next_attempt_at <= now_iso
+
+
 def _active_lease_count(run, now):
     """Count ordinary tasks in this run holding a strictly unexpired lease.
 
@@ -683,6 +695,13 @@ class Scheduler:
         Once the tenant has any registered worker the claim must come from an
         active registration (``worker_not_registered`` / ``worker_expired``);
         a tenant with no registrations keeps the legacy non-empty-id rule.
+
+        A ready step whose retry backoff is still pending
+        (``next_attempt_at`` in the future) is not leased; other ready tasks
+        whose backoff has elapsed are handed out in the usual order instead.
+        When nothing is leased and no lease takeover or root activation
+        happened, the run's state, history and ``updated_at`` are left
+        exactly as stored.
         """
         if not isinstance(worker_id, str) or not worker_id.strip():
             raise WorkflowError("worker_id must be a non-empty string", "bad_worker")
@@ -703,9 +722,11 @@ class Scheduler:
             if not_before is not None and float(not_before) > now:
                 # Still sleeping: activation happens only via a due claim.
                 return None
-            self._expire_leases(run, now)
-            self._open_root_nodes(run)
-            candidates = [s for s in run["steps"].values() if s["status"] == STEP_READY]
+            reclaimed = self._expire_leases(run, now)
+            opened_ready, opened_waiting = self._open_root_nodes(run)
+            now_iso = self._iso()
+            candidates = [s for s in run["steps"].values()
+                          if s["status"] == STEP_READY and _retry_due(s, now_iso)]
             index = run["order_index"]
             quota = run.get("max_parallelism")
             at_quota = quota is not None and _active_lease_count(run, now) >= int(quota)
@@ -717,6 +738,10 @@ class Scheduler:
                             lease_deadline=now + float(lease_seconds), started_at=self._iso())
                 self._event(run, run_id, step["id"], "claim", attempt=step["attempt"],
                             worker_id=worker_id, lease_deadline=step["lease_deadline"])
+            elif not reclaimed and not opened_ready and not opened_waiting:
+                # Nothing to lease and nothing else changed: keep the stored
+                # state, history and updated_at untouched.
+                return None
             run["status"] = _derive_run_status(run)
             if step is not None and run["status"] == RUN_RUNNING and previous == RUN_PENDING:
                 self._event(run, run_id, None, "run_started")
@@ -731,14 +756,17 @@ class Scheduler:
         ``not_before`` has come due are activated (root nodes opened, one
         ``ready``/``waiting`` event each) in ``run_id`` order.  Then the
         candidates — runs that are not terminal, not still sleeping, hold at
-        least one ``ready`` ordinary task and have not reached their
+        least one ``ready`` ordinary task whose retry backoff has elapsed
+        (``next_attempt_at`` reached) and have not reached their
         ``max_parallelism`` — are ordered by fairness: the number of
         ``claim`` events in the run's history (fewest first), then
-        ``created_at``, then ``run_id``.  Expired leases are reclaimed with
-        the usual ``takeover`` events before slots are counted, exactly like
-        the single-run claim.  The winner leases its next task in
-        ``(topological index, step id)`` order, recording the usual ``claim``
-        and, when the run leaves ``pending``, ``run_started`` events.
+        ``created_at``, then ``run_id``.  A run holding only not-yet-due
+        retries is skipped and its fairness count is left alone.  Expired
+        leases are reclaimed with the usual ``takeover`` events before slots
+        are counted, exactly like the single-run claim.  The winner leases
+        its next due task in ``(topological index, step id)`` order,
+        recording the usual ``claim`` and, when the run leaves ``pending``,
+        ``run_started`` events.
 
         Returns ``(run_id, step)`` or ``None`` when no run is eligible; at
         most one task is leased per call.  The fairness count is rebuilt
@@ -766,6 +794,7 @@ class Scheduler:
                 run["updated_at"] = self._iso()
                 self.store.save_run(run)
             # Pick the fairest eligible run.
+            now_iso = self._iso(now)
             best_key, best_run, best_previous = None, None, None
             for run in runs:
                 if run["status"] in TERMINAL_RUN_STATES:
@@ -779,7 +808,8 @@ class Scheduler:
                     run["status"] = _derive_run_status(run)
                     run["updated_at"] = self._iso()
                     self.store.save_run(run)
-                ready = [s for s in run["steps"].values() if s["status"] == STEP_READY]
+                ready = [s for s in run["steps"].values()
+                         if s["status"] == STEP_READY and _retry_due(s, now_iso)]
                 if not ready:
                     continue
                 quota = run.get("max_parallelism")
@@ -793,7 +823,8 @@ class Scheduler:
                 return None
             run = best_run
             index = run["order_index"]
-            step = min((s for s in run["steps"].values() if s["status"] == STEP_READY),
+            step = min((s for s in run["steps"].values()
+                        if s["status"] == STEP_READY and _retry_due(s, now_iso)),
                        key=lambda s: (index.get(s["id"], 0), s["id"]))
             step.update(status=STEP_RUNNING, worker_id=worker_id, next_attempt_at=None,
                         lease_deadline=now + lease, started_at=self._iso())
@@ -916,7 +947,7 @@ class Scheduler:
                             next_attempt_at=self._iso(now + backoff_seconds(
                                 step["attempt"], self.backoff_base)))
                 self._event(run, run_id, step_id, "retry", attempt=step["attempt"],
-                            worker_id=worker_id)
+                            worker_id=worker_id, next_attempt_at=step["next_attempt_at"])
             run["status"] = _derive_run_status(run)
             if run["status"] == RUN_FAILED:
                 self._event(run, run_id, None, "run_failed")
@@ -1012,7 +1043,8 @@ class Scheduler:
                 step.update(status=STEP_WAITING)
             elif etype == "claim":
                 step.update(status=STEP_RUNNING, worker_id=event.get("worker_id"),
-                            started_at=at, lease_deadline=event.get("lease_deadline"))
+                            started_at=at, lease_deadline=event.get("lease_deadline"),
+                            next_attempt_at=None)
             elif etype == "heartbeat":
                 step["lease_deadline"] = event.get("lease_deadline")
             elif etype == "takeover":
@@ -1030,9 +1062,10 @@ class Scheduler:
                 step.update(error=event.get("error"), worker_id=None, lease_deadline=None,
                             attempt=step["attempt"] if attempt is None else attempt)
             elif etype == "retry":
-                step["status"] = STEP_READY
+                step.update(status=STEP_READY, ready_at=at,
+                            next_attempt_at=event.get("next_attempt_at"))
             elif etype == "attempts_exhausted":
-                step.update(status=STEP_FAILED, finished_at=at)
+                step.update(status=STEP_FAILED, finished_at=at, next_attempt_at=None)
         if all(s["status"] == STEP_SUCCEEDED for s in steps.values()):
             rebuilt["status"] = RUN_SUCCEEDED
         elif any(s["status"] == STEP_FAILED for s in steps.values()):
