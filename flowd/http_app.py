@@ -123,6 +123,10 @@ class _Handler(BaseHTTPRequestHandler):
             schedule_dispatch = re.fullmatch(r"/v1/schedules/([^/]+)/dispatch", path)
             if schedule_dispatch:
                 return self._dispatch_schedule(unquote(schedule_dispatch.group(1)), self._body())
+            schedule_action = re.fullmatch(r"/v1/schedules/([^/]+)/(pause|resume)", path)
+            if schedule_action:
+                return self._schedule_pause_resume(unquote(schedule_action.group(1)),
+                                                   schedule_action.group(2), self._body())
             action = re.fullmatch(r"/v1/runs/([^/]+)/(claim|complete|fail|decision|heartbeat|cancel|pause|resume)", path)
             if action:
                 if action.group(2) == "decision":
@@ -213,6 +217,20 @@ class _Handler(BaseHTTPRequestHandler):
         if run is None:
             return self._send(204)
         return self._json(201, _run_view(run, scheduled_at=scheduled_at))
+
+    def _schedule_pause_resume(self, schedule_id, action, body):
+        """Pause or resume a schedule; strict tenant/actor validation."""
+        tenant = body.get("tenant")
+        if not isinstance(tenant, str) or not tenant.strip():
+            raise WorkflowError("tenant must be a non-empty string", "bad_tenant")
+        actor = body.get("actor")
+        if not isinstance(actor, str) or not actor.strip():
+            raise WorkflowError("actor must be a non-empty string", "bad_actor")
+        if action == "pause":
+            record = self.scheduler.pause_schedule(tenant.strip(), schedule_id, actor.strip())
+        else:
+            record = self.scheduler.resume_schedule(tenant.strip(), schedule_id, actor.strip())
+        return self._json(200, _schedule_view(record))
 
     # -- worker registry -----------------------------------------------
     def _worker_lease(self, body):
@@ -363,6 +381,7 @@ def _schedule_view(record):
             "first_at": record.get("first_at"), "next_at": record.get("next_at"),
             "params": record.get("params") or {},
             "max_parallelism": record.get("max_parallelism"),
+            "status": record.get("status", "active"),
             "created_at": record.get("created_at"), "updated_at": record.get("updated_at")}
 
 

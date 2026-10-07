@@ -400,6 +400,17 @@ def _roots_opened(run):
     return any(e.get("type") in ("ready", "waiting") for e in run.get("history") or [])
 
 
+def _schedule_record(record):
+    """Copy a stored schedule record, backfilling ``status``.
+
+    Records written before schedule pause existed have no ``status`` field
+    and read back as ``active``.
+    """
+    view = dict(record)
+    view.setdefault("status", "active")
+    return view
+
+
 class Scheduler:
     """Coordinates workers against a :class:`WorkflowStore`."""
 
@@ -669,6 +680,7 @@ class Scheduler:
                 "next_at": next_at,
                 "params": params,
                 "max_parallelism": max_parallelism,
+                "status": "active",
                 "created_at": self._iso(now),
                 "updated_at": self._iso(now),
             }
@@ -679,11 +691,15 @@ class Scheduler:
             return dict(record)
 
     def list_schedules(self, tenant):
-        """Return the tenant's schedules sorted by schedule_id."""
+        """Return the tenant's schedules sorted by schedule_id.
+
+        Records written before schedule pause existed carry no ``status``;
+        they read back as ``active``.
+        """
         tenant = normalize_tenant(tenant)
         with self.store.locked():
             schedules = self.store.load_schedules(tenant)
-            return [dict(schedules[sid]) for sid in sorted(schedules)]
+            return [_schedule_record(schedules[sid]) for sid in sorted(schedules)]
 
     def dispatch_schedule(self, tenant, schedule_id):
         """Fire a schedule when due.
@@ -693,7 +709,10 @@ class Scheduler:
         the single due trigger point is processed per call: ``next_at``
         advances by exactly one interval, so a repeat before the next
         trigger is due changes nothing and missed trigger points are caught
-        up one per call in chronological order.
+        up one per call in chronological order.  A paused schedule (see
+        :meth:`pause_schedule`) conflicts with ``schedule_paused`` after
+        the tenant and ownership checks, without touching ``next_at``, any
+        run or the audit stream.
         """
         tenant = normalize_tenant(tenant)
         schedule_id = normalize_schedule_id(schedule_id)
@@ -710,6 +729,12 @@ class Scheduler:
                 )
             schedules = self.store.load_schedules(tenant)
             record = schedules[schedule_id]
+            if record.get("status", "active") == "paused":
+                # Paused by the tenant: never fire, never move next_at,
+                # never touch runs or the audit stream.
+                raise ConflictError(
+                    "schedule %s is paused" % schedule_id, "schedule_paused"
+                )
             scheduled_at = float(record["next_at"])
             if now < scheduled_at:
                 return None, None
@@ -728,6 +753,66 @@ class Scheduler:
             self.store.append_audit(tenant, "schedule.dispatch", schedule_id=schedule_id,
                                     run_id=run["run_id"])
             return run, scheduled_at
+
+    def _set_schedule_status(self, tenant, schedule_id, actor, target, action):
+        """Shared pause/resume transition; a repeat of the target is a no-op.
+
+        Tenant, schedule id and actor are validated first, then ownership:
+        an unknown schedule is ``unknown_schedule`` and another tenant's
+        schedule is ``cross_tenant`` — a failure never writes state nor
+        appends audit records.  A schedule already in the target status
+        returns its current record with ``updated_at`` untouched and no new
+        audit record; a real transition sets the status, refreshes
+        ``updated_at`` and appends one ``action`` audit record carrying the
+        actor.  ``next_at`` is never touched.
+        """
+        tenant = normalize_tenant(tenant)
+        schedule_id = normalize_schedule_id(schedule_id)
+        actor = self._normalize_actor(actor)
+        with self.store.locked():
+            owner = self.store.schedule_exists(schedule_id)
+            if owner is None:
+                raise WorkflowError(
+                    "unknown schedule: %s" % schedule_id, "unknown_schedule"
+                )
+            if owner != tenant:
+                raise WorkflowError(
+                    "schedule %s belongs to another tenant" % schedule_id, "cross_tenant"
+                )
+            schedules = self.store.load_schedules(tenant)
+            record = schedules[schedule_id]
+            if record.get("status", "active") == target:
+                # Idempotent repeat: the stored record is returned as is.
+                return _schedule_record(record)
+            record["status"] = target
+            record["updated_at"] = self._iso()
+            schedules[schedule_id] = record
+            self.store.save_schedules(tenant, schedules)
+            self.store.append_audit(tenant, action, schedule_id=schedule_id, actor=actor)
+            return _schedule_record(record)
+
+    def pause_schedule(self, tenant, schedule_id, actor):
+        """Pause an active schedule; a repeat pause is a no-op.
+
+        Pausing only stops future dispatches (``schedule_paused``): the
+        schedule, its ``next_at`` and every run it already created are
+        kept.  The transition appends one ``schedule.pause`` audit record
+        carrying the actor.
+        """
+        return self._set_schedule_status(tenant, schedule_id, actor,
+                                         "paused", "schedule.pause")
+
+    def resume_schedule(self, tenant, schedule_id, actor):
+        """Resume a paused schedule; a repeat resume is a no-op.
+
+        Resuming only re-enables dispatching: the original ``next_at`` is
+        kept, so no run is created by the resume itself and missed trigger
+        points are still caught up one per dispatch in chronological order.
+        The transition appends one ``schedule.resume`` audit record
+        carrying the actor.
+        """
+        return self._set_schedule_status(tenant, schedule_id, actor,
+                                         "active", "schedule.resume")
 
     # -- worker registry -----------------------------------------------
     def _worker_view(self, record, now=None):

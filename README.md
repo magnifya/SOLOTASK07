@@ -69,7 +69,9 @@ the only accepted values are `task` and `approval`.  A step may also set
 | GET | `/v1/workers?tenant=` | 200 `{"tenant":...,"items":[...]}` sorted by worker_id | 400 missing tenant |
 | POST | `/v1/schedules` | 201 schedule record with `next_at` | 400 bad_tenant/bad_schedule_id/bad_interval/bad_first_at/bad_params/bad_max_parallelism/bad JSON, 404 unknown workflow, 409 schedule_exists |
 | GET | `/v1/schedules?tenant=` | 200 `{"tenant":...,"items":[...]}` sorted by schedule_id | 400 missing tenant |
-| POST | `/v1/schedules/{schedule_id}/dispatch` | 201 scheduled run, 204 not due yet | 400 bad_tenant/bad_schedule_id/bad JSON, 403 cross-tenant, 404 unknown schedule |
+| POST | `/v1/schedules/{schedule_id}/dispatch` | 201 scheduled run, 204 not due yet | 400 bad_tenant/bad_schedule_id/bad JSON, 403 cross-tenant, 404 unknown schedule, 409 schedule_paused |
+| POST | `/v1/schedules/{schedule_id}/pause` | 200 paused schedule (repeat is a no-op) | 400 bad_tenant/bad_schedule_id/bad_actor/bad JSON, 403 cross-tenant, 404 unknown schedule |
+| POST | `/v1/schedules/{schedule_id}/resume` | 200 resumed schedule (repeat is a no-op) | 400 bad_tenant/bad_schedule_id/bad_actor/bad JSON, 403 cross-tenant, 404 unknown schedule |
 | GET | `/v1/runs?tenant=&status=&limit=&after=` | 200 `{"items":[...],"next_after":...}` | 400 missing tenant |
 | GET | `/v1/audit?tenant=&action=&run_id=&limit=&after=` | 200 `{"tenant":...,"items":[...],"next_after":...}` | 400 bad_tenant/bad_action/bad_run_id/bad_limit/bad_after |
 
@@ -94,7 +96,8 @@ Run actions reuse the existing history types (`run_created`, `ready`,
 control-plane operations use
 fixed `resource.action`
 identifiers: `workflow.submit`, `worker.register`, `worker.heartbeat`,
-`schedule.create` and `schedule.dispatch`. Records carry only identifiers
+`schedule.create`, `schedule.dispatch`, `schedule.pause` and
+`schedule.resume`. Records carry only identifiers
 and the actor (the decision maker on `decision` records, the canceller on
 `cancel`/`run_cancelled` records, the pauser/resumer on
 `pause`/`run_paused`/`run_resumed` records, `null` elsewhere)
@@ -280,7 +283,8 @@ codes are `bad_tenant`, `bad_schedule_id`, `bad_interval`, `bad_first_at`,
 `bad_params`, `bad_max_parallelism`; an unknown workflow is
 `unknown_workflow` (404) and a duplicate id within the same tenant is
 `schedule_exists` (409). The response is the stored record and includes
-`first_at` and `next_at`. `GET /v1/schedules?tenant=` returns the
+`first_at`, `next_at` and `status` (`active` on a new schedule).
+`GET /v1/schedules?tenant=` returns the
 tenant's schedules sorted by `schedule_id`.
 
 Schedules do not run on a timer: they produce runs only when an
@@ -304,6 +308,31 @@ external trigger calls
 - If several trigger points were missed, each due dispatch processes the
   oldest one (`scheduled_at` values come out in chronological order);
   callers simply repeat dispatch until they get a 204 to catch up.
+
+A schedule can be paused and resumed per tenant with
+`POST /v1/schedules/{schedule_id}/pause` and
+`POST /v1/schedules/{schedule_id}/resume`, both taking
+`{"tenant": ..., "actor": ...}` (`Scheduler.pause_schedule` /
+`Scheduler.resume_schedule`). The persisted `status` is `active` or
+`paused` and is returned by create, pause, resume and the listing;
+records written before this field existed read back as `active`.
+
+- Pausing only blocks future dispatches: the schedule, its `next_at` and
+  every run it already created are kept. Pausing an `active` schedule
+  sets `status` to `paused`, refreshes `updated_at` and appends one
+  `schedule.pause` audit record carrying the actor; repeating the pause
+  returns the current record without changing `updated_at` or appending
+  another audit record. Resuming follows the same rules back to `active`
+  with a `schedule.resume` audit record and never fires the schedule
+  itself — the original `next_at` is kept, so missed trigger points are
+  still caught up one per dispatch in chronological order.
+- Dispatching a paused schedule passes the tenant and ownership checks
+  first, then always returns **409** (`schedule_paused`) without touching
+  `next_at`, any run or the audit stream. An unknown schedule is 404
+  (`unknown_schedule`) and another tenant's schedule is 403
+  (`cross_tenant`) on pause/resume exactly as on dispatch; validation
+  failures (`bad_json`, `bad_tenant`, `bad_schedule_id`, `bad_actor`)
+  never write state nor append audit records.
 
 The schedule record and `next_at` live in `<tenant>/schedules.json` and
 survive a process restart over the same data directory. Runs created by
