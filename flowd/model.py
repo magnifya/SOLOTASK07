@@ -9,12 +9,17 @@ self/cyclic dependencies and bad ``max_attempts`` values.  Each step may
 also declare a ``trigger_rule`` — ``all_success`` (the default when the
 field is omitted), ``all_done`` or ``any_success`` — governing which
 dependency outcomes unlock it; any other value (including an explicit
-``null``) is rejected with ``bad_trigger_rule``.  A validated plan
+``null``) is rejected with ``bad_trigger_rule``.  A task step may also
+declare ``retry_backoff_seconds``, a finite positive number used as the
+exponential backoff base for its retries; omitted or ``null`` keeps the
+scheduler's own base, and any other bad value — or a non-null value on an
+approval step — is rejected with ``bad_retry_backoff``.  A validated plan
 is returned topologically sorted (ties broken by step id) so scheduling
 order is deterministic.
 """
 
 import heapq
+import math
 import time as _time
 
 STEP_STATES = ("pending", "ready", "running", "waiting", "succeeded", "failed", "cancelled",
@@ -100,8 +105,44 @@ def validate_step(raw, index, seen_ids):
         # Omitted means the legacy rule: unlock only when all dependencies
         # succeeded.  An explicit null is rejected like any other bad value.
         trigger_rule = TRIGGER_ALL_SUCCESS
+    retry_backoff_seconds = normalize_retry_backoff(raw.get("retry_backoff_seconds"), step_id,
+                                                    kind)
     return {"id": step_id, "depends_on": depends_on, "max_attempts": max_attempts,
-            "kind": kind, "trigger_rule": trigger_rule}
+            "kind": kind, "trigger_rule": trigger_rule,
+            "retry_backoff_seconds": retry_backoff_seconds}
+
+
+def normalize_retry_backoff(value, step_id, kind):
+    """Validate an optional per-step retry backoff base in seconds.
+
+    ``None`` (omitted or explicit ``null``) means the step keeps the
+    scheduler's own backoff base.  Otherwise the value must be a finite
+    number strictly greater than zero; booleans, strings, zero, negatives,
+    ``NaN`` and infinities are rejected with ``bad_retry_backoff``, and so
+    is any non-null value on an approval step (approvals never retry).
+    """
+    if value is None:
+        return None
+    if kind == KIND_APPROVAL:
+        raise WorkflowError(
+            "step %s: approval steps cannot set retry_backoff_seconds" % step_id,
+            "bad_retry_backoff",
+        )
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise WorkflowError(
+            "step %s: retry_backoff_seconds must be a finite positive number" % step_id,
+            "bad_retry_backoff",
+        )
+    try:
+        seconds = float(value)
+    except OverflowError:
+        seconds = float("inf")
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise WorkflowError(
+            "step %s: retry_backoff_seconds must be a finite positive number" % step_id,
+            "bad_retry_backoff",
+        )
+    return seconds
 
 
 def topo_order(steps):

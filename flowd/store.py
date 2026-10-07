@@ -275,6 +275,9 @@ def normalize_run(run):
     Steps without ``trigger_rule`` predate trigger rules and unlock only
     when every dependency succeeds (``all_success``); the same default is
     backfilled into frozen plan snapshots written before the field existed.
+    Steps without ``retry_backoff_seconds`` predate per-step backoff bases
+    and retry with the scheduler's own base (``None``); the same default is
+    backfilled into frozen plan snapshots.
     Mutates and returns ``run``.
     """
     run.setdefault("max_parallelism", None)
@@ -287,10 +290,12 @@ def normalize_run(run):
         step.setdefault("trigger_rule", TRIGGER_ALL_SUCCESS)
         step.setdefault("approval", None)
         step.setdefault("next_attempt_at", None)
+        step.setdefault("retry_backoff_seconds", None)
     plan = run.get("plan")
     if plan:
         for planned in plan.get("steps") or []:
             planned.setdefault("trigger_rule", TRIGGER_ALL_SUCCESS)
+            planned.setdefault("retry_backoff_seconds", None)
     else:
         run["plan"] = plan_from_run(run)
     return run
@@ -314,6 +319,7 @@ def plan_from_run(run):
             "max_attempts": steps[sid]["max_attempts"],
             "kind": steps[sid].get("kind", KIND_TASK),
             "trigger_rule": steps[sid].get("trigger_rule", TRIGGER_ALL_SUCCESS),
+            "retry_backoff_seconds": steps[sid].get("retry_backoff_seconds"),
         }
         for sid in order
     ]
@@ -350,6 +356,7 @@ def new_run(tenant, workflow_id, run_id, params, plan, now_iso, max_parallelism=
             "id": step["id"],
             "kind": step.get("kind", KIND_TASK),
             "trigger_rule": step.get("trigger_rule", TRIGGER_ALL_SUCCESS),
+            "retry_backoff_seconds": step.get("retry_backoff_seconds"),
             "depends_on": list(step["depends_on"]),
             "max_attempts": step["max_attempts"],
             "status": STEP_PENDING,
@@ -381,8 +388,9 @@ def new_run(tenant, workflow_id, run_id, params, plan, now_iso, max_parallelism=
         "updated_at": now_iso,
         # The normalized DAG as it was when this run was created.  A later
         # submission of another workflow with the same id must not rewrite
-        # this run's nodes, order, kinds, dependencies, max_attempts or
-        # trigger rules; replay rebuilds exclusively from this snapshot.
+        # this run's nodes, order, kinds, dependencies, max_attempts,
+        # trigger rules or retry backoff bases; replay rebuilds exclusively
+        # from this snapshot.
         "plan": {
             "workflow_id": plan["workflow_id"],
             "steps": [dict(step) for step in plan["steps"]],

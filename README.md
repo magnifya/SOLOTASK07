@@ -530,14 +530,44 @@ exhausted retry or rejection fails it immediately.  Approvals, leases,
 retries, takeover, quotas, fair claim, delayed and periodic scheduling,
 idempotency, cancellation and the tenant audit stream are unchanged.
 
+### Per-step retry backoff
+
+A task step may declare `retry_backoff_seconds` in `POST /v1/workflows`:
+a finite positive number (integer or float) used as the exponential
+backoff base for that step's retries.  The first failure waits exactly the
+base, and each subsequent failure waits `base * 2 ** (attempt - 1)`.
+Omitting the field or passing `null` keeps the scheduler's own backoff
+base, so existing workflows and runs are unaffected.  Booleans, strings,
+zero, negatives, `NaN` and infinities are rejected with 400
+(`bad_retry_backoff`), and so is any non-null value on an `approval` step
+(approvals never retry); a rejected submission is neither saved nor
+overwritten and appends no audit record.  The CLI `submit` and
+`Scheduler.submit` apply the same validation, and the success response
+returns the normalized value.
+
+The base is frozen into the run at creation time — for manual, idempotent
+and periodic-schedule creations alike — so a later same-name submission
+cannot change an existing run's retry schedule, and runs and workflows
+written before the field existed keep the scheduler's base.  While a
+retry waits, the step stays `ready` but is leased by neither the
+single-run claim nor the tenant-wide fair claim until the current time
+reaches `next_attempt_at` (a step whose time has exactly arrived is
+claimable), and the waiting step holds no concurrency quota.  The `retry`
+history event records the computed `next_attempt_at`, so
+`Scheduler.replay`, run details, the listing and `flowd status` reproduce
+the same policy and state after a restart.  Reaching `max_attempts` still
+fails the step immediately and clears `next_attempt_at`.
+
 ### Workflow versions and same-name submissions
 
 The normalized DAG definition used when a run is created — step order, node
-`kind`, dependencies and `max_attempts` — is snapshotted into the run
+`kind`, dependencies, `max_attempts` and `retry_backoff_seconds` — is
+snapshotted into the run
 document (`plan`) at creation time and never changes afterwards. Submitting
 another workflow under the same `workflow_id` in the same tenant only
 governs runs created after that submission; it cannot rewrite an existing
-run's nodes, order, kinds, dependencies, retry limits or state machine.
+run's nodes, order, kinds, dependencies, retry limits, backoff bases or
+state machine.
 
 `Scheduler.replay` rebuilds a run exclusively from its frozen definition
 plus the append-only history, never from the workflow currently registered

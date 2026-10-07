@@ -1189,9 +1189,15 @@ class Scheduler:
                 # may now unlock (all_done) or skip (all_success/any_success).
                 self._open_root_nodes(run)
             else:
+                # The backoff base is the one frozen into the run at
+                # creation (the step's own retry_backoff_seconds); steps
+                # without one keep this scheduler's base.
+                base = step.get("retry_backoff_seconds")
+                if base is None:
+                    base = self.backoff_base
                 step.update(status=STEP_READY, ready_at=self._iso(),
                             next_attempt_at=self._iso(now + backoff_seconds(
-                                step["attempt"], self.backoff_base)))
+                                step["attempt"], base)))
                 self._event(run, run_id, step_id, "retry", attempt=step["attempt"],
                             worker_id=worker_id, next_attempt_at=step["next_attempt_at"])
             run["status"] = _derive_run_status(run)
