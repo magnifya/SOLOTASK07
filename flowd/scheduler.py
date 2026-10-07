@@ -21,6 +21,7 @@ from .model import (
 from .store import (
     RUN_CANCELLED,
     RUN_FAILED,
+    RUN_PAUSED,
     RUN_PENDING,
     RUN_RUNNING,
     RUN_SUCCEEDED,
@@ -912,6 +913,9 @@ class Scheduler:
             if not_before is not None and float(not_before) > now:
                 # Still sleeping: activation happens only via a due claim.
                 return None
+            if run["status"] == RUN_PAUSED:
+                # Frozen by the tenant: no activation, reclaim or lease.
+                return None
             tenant_quota = self._tenant_quota_limit(tenant)
             if tenant_quota is None:
                 reclaimed = self._expire_leases(run, now)
@@ -1007,9 +1011,10 @@ class Scheduler:
                     return None
             # Activate due sleeping runs in run_id order; already-activated
             # runs are left untouched.  Terminal runs (including a cancelled
-            # run whose roots were never opened) are never activated.
+            # run whose roots were never opened) and paused runs are never
+            # activated.
             for run in runs:
-                if run["status"] in TERMINAL_RUN_STATES:
+                if run["status"] in TERMINAL_RUN_STATES or run["status"] == RUN_PAUSED:
                     continue
                 not_before = run.get("not_before")
                 if not_before is None or float(not_before) > now:
@@ -1024,7 +1029,7 @@ class Scheduler:
             now_iso = self._iso(now)
             best_key, best_run, best_previous = None, None, None
             for run in runs:
-                if run["status"] in TERMINAL_RUN_STATES:
+                if run["status"] in TERMINAL_RUN_STATES or run["status"] == RUN_PAUSED:
                     continue
                 not_before = run.get("not_before")
                 if not_before is not None and float(not_before) > now:
@@ -1252,6 +1257,104 @@ class Scheduler:
             self.store.save_run(run)
             return run
 
+    # -- pause / resume ------------------------------------------------
+    @staticmethod
+    def _normalize_actor(actor):
+        if not isinstance(actor, str):
+            raise WorkflowError("actor must be a string", "bad_actor")
+        actor = actor.strip()
+        if not actor:
+            raise WorkflowError("actor must be a non-empty string", "bad_actor")
+        return actor
+
+    def pause(self, tenant, run_id, actor):
+        """Freeze an unfinished run; a repeat pause is a no-op.
+
+        Only a ``pending`` or ``running`` run can be paused.  Every
+        ``running`` task releases its lease and goes back to ``ready`` with
+        ``worker_id``, ``lease_deadline`` and ``next_attempt_at`` cleared and
+        its ``attempt`` unchanged, recording one ``pause`` event per revoked
+        task in topological order; a final run-level ``run_paused`` event
+        carrying the actor closes the transition, and the audit stream
+        follows the same order.  Completed nodes, waiting approvals and a
+        not-yet-due delayed start are preserved exactly: no node is opened,
+        no attempt is counted and ``not_before`` is untouched.  Freed leases
+        stop counting against the tenant quota immediately, so ``complete``,
+        ``fail`` and ``heartbeat`` against the revoked tasks all fail, and
+        claims hand out nothing while the run is paused.
+
+        A run that is already ``paused`` returns the current document
+        without new history, audit records or a changed ``updated_at``; a
+        ``succeeded``, ``failed`` or ``cancelled`` run conflicts
+        (``run_finished``).
+        """
+        tenant = normalize_tenant(tenant)
+        actor = self._normalize_actor(actor)
+        with self.store.locked():
+            owner = self.store.run_exists(run_id)
+            if owner is None:
+                raise WorkflowError("unknown run: %s" % run_id, "unknown_run")
+            if owner != tenant:
+                raise WorkflowError("run %s belongs to another tenant" % run_id, "cross_tenant")
+            run = self.get_run(tenant, run_id)
+            if run["status"] == RUN_PAUSED:
+                # Idempotent repeat: the stored document is returned as is.
+                return run
+            if run["status"] in TERMINAL_RUN_STATES:
+                raise ConflictError("run %s is already %s" % (run_id, run["status"]),
+                                    "run_finished")
+            index = run["order_index"]
+            for sid in sorted(run["steps"], key=lambda s: index.get(s, 0)):
+                step = run["steps"][sid]
+                if step["status"] != STEP_RUNNING:
+                    continue
+                holder = step.get("worker_id")
+                step.update(status=STEP_READY, worker_id=None, lease_deadline=None,
+                            next_attempt_at=None)
+                self._event(run, run_id, sid, "pause", attempt=step["attempt"],
+                            worker_id=holder, actor=actor)
+            run["status"] = RUN_PAUSED
+            self._event(run, run_id, None, "run_paused", actor=actor)
+            run["updated_at"] = self._iso()
+            self.store.save_run(run)
+            return run
+
+    def resume(self, tenant, run_id, actor):
+        """Unfreeze a paused run; a repeat resume is a no-op.
+
+        Only a ``paused`` run can be resumed.  The run goes back to the
+        status its nodes derive (``pending`` or ``running``) and a run-level
+        ``run_resumed`` event carrying the actor is appended; no task is
+        leased, no node is opened and a not-yet-due ``not_before`` still
+        gates activation, so work continues only through later claims.  Any
+        other state conflicts (``not_paused``) — except the idempotent
+        repeat of a resume that already happened, which returns the current
+        document without new history, audit records or a changed
+        ``updated_at``.
+        """
+        tenant = normalize_tenant(tenant)
+        actor = self._normalize_actor(actor)
+        with self.store.locked():
+            owner = self.store.run_exists(run_id)
+            if owner is None:
+                raise WorkflowError("unknown run: %s" % run_id, "unknown_run")
+            if owner != tenant:
+                raise WorkflowError("run %s belongs to another tenant" % run_id, "cross_tenant")
+            run = self.get_run(tenant, run_id)
+            if run["status"] == RUN_PAUSED:
+                run["status"] = _derive_run_status(run)
+                self._event(run, run_id, None, "run_resumed", actor=actor)
+                run["updated_at"] = self._iso()
+                self.store.save_run(run)
+                return run
+            if run["status"] not in TERMINAL_RUN_STATES:
+                markers = [e.get("type") for e in run["history"]
+                           if e.get("type") in ("run_paused", "run_resumed")]
+                if markers and markers[-1] == "run_resumed":
+                    # Idempotent repeat: the stored document is returned as is.
+                    return run
+            raise ConflictError("run %s is not paused" % run_id, "not_paused")
+
     # -- human decisions -----------------------------------------------
     def decide(self, tenant, run_id, step_id, actor, decision):
         """Record a human approve/reject decision for an approval step.
@@ -1269,6 +1372,8 @@ class Scheduler:
             run = self.get_run(tenant, run_id)
             if run["status"] == RUN_CANCELLED:
                 raise ConflictError("run %s is cancelled" % run_id, "run_cancelled")
+            if run["status"] == RUN_PAUSED:
+                raise ConflictError("run %s is paused" % run_id, "run_paused")
             step = run["steps"].get(step_id)
             if step is None:
                 raise WorkflowError("unknown step: %s" % step_id, "unknown_step")
@@ -1352,6 +1457,7 @@ class Scheduler:
         rebuilt["step_order"] = list(plan["order"])
         rebuilt["order_index"] = {sid: i for i, sid in enumerate(plan["order"])}
         steps = rebuilt["steps"]
+        paused = False
         for event in stored["history"]:
             sid, etype, at = event.get("step_id"), event.get("type"), event.get("at")
             attempt = event.get("attempt")
@@ -1360,7 +1466,12 @@ class Scheduler:
                 # run_failed, run_cancelled) need no replay action: the run
                 # status is derived from the rebuilt nodes at the end,
                 # exactly as every live transition derives it before
-                # persisting.
+                # persisting.  run_paused/run_resumed only toggle whether
+                # that derived status is reported as paused.
+                if etype == "run_paused":
+                    paused = True
+                elif etype == "run_resumed":
+                    paused = False
                 continue
             step = steps.get(sid)
             if step is None:
@@ -1414,12 +1525,22 @@ class Scheduler:
                 # releases its lease; ready_at/started_at stay as recorded.
                 step.update(status=STEP_CANCELLED, worker_id=None, lease_deadline=None,
                             next_attempt_at=None)
+            elif etype == "pause":
+                # Mirrors pause(): the revoked task goes back to ready with
+                # its attempt unchanged and its lease fields cleared;
+                # ready_at/started_at stay as recorded.
+                step.update(status=STEP_READY, worker_id=None, lease_deadline=None,
+                            next_attempt_at=None)
         # Every live write path derives the run status from its nodes, so
         # rebuilding from the same nodes yields the same status — including
         # the pending/running boundary (a run with only ready/waiting nodes
         # and no claim is still pending; a retry-queued run has returned to
-        # pending even though a run_started event exists).
-        rebuilt["status"] = _derive_run_status(rebuilt)
+        # pending even though a run_started event exists).  A pause still in
+        # effect reports the run as paused instead, unless a later cancel
+        # already moved it to a terminal state.
+        derived = _derive_run_status(rebuilt)
+        rebuilt["status"] = (RUN_PAUSED if paused and derived not in TERMINAL_RUN_STATES
+                             else derived)
         rebuilt["updated_at"] = stored.get("updated_at")
         rebuilt["history"] = copy.deepcopy(stored["history"])
         return rebuilt

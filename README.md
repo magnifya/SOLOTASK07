@@ -62,6 +62,8 @@ the only accepted values are `task` and `approval`.  A step may also set
 | POST | `/v1/runs/{run_id}/decision` | 200 updated run | 400 bad request/JSON, 403 cross-tenant, 404 unknown run/step, 409 not an approval/not waiting/already decided |
 | POST | `/v1/runs/{run_id}/heartbeat` | 200 updated run | 400 bad request/JSON, 403 cross-tenant, 404 unknown run/step, 409 finished run/approval node/lease not held/expired |
 | POST | `/v1/runs/{run_id}/cancel` | 200 cancelled run (repeat is a no-op) | 400 bad tenant/actor/JSON, 403 cross-tenant, 404 unknown run, 409 run already finished |
+| POST | `/v1/runs/{run_id}/pause` | 200 paused run (repeat is a no-op) | 400 bad tenant/actor/JSON, 403 cross-tenant, 404 unknown run, 409 run already finished |
+| POST | `/v1/runs/{run_id}/resume` | 200 resumed run (repeat is a no-op) | 400 bad tenant/actor/JSON, 403 cross-tenant, 404 unknown run, 409 run not paused |
 | POST | `/v1/workers/register` | 201 new registration, 200 refreshed registration | 400 bad tenant/worker_id/lease_seconds/JSON |
 | POST | `/v1/workers/{worker_id}/heartbeat` | 200 registration record | 400 bad tenant/lease_seconds/JSON, 404 unknown worker, 409 worker_expired |
 | GET | `/v1/workers?tenant=` | 200 `{"tenant":...,"items":[...]}` sorted by worker_id | 400 missing tenant |
@@ -87,13 +89,15 @@ stored in `<tenant>/audit.json` and readable via
 
 Run actions reuse the existing history types (`run_created`, `ready`,
 `waiting`, `skipped`, `claim`, `heartbeat`, `takeover`, `complete`, `fail`,
-`retry`, `attempts_exhausted`, `decision`, `cancel`, `run_started`,
-`run_succeeded`, `run_failed`, `run_cancelled`); control-plane operations use
+`retry`, `attempts_exhausted`, `decision`, `cancel`, `pause`, `run_started`,
+`run_succeeded`, `run_failed`, `run_cancelled`, `run_paused`, `run_resumed`);
+control-plane operations use
 fixed `resource.action`
 identifiers: `workflow.submit`, `worker.register`, `worker.heartbeat`,
 `schedule.create` and `schedule.dispatch`. Records carry only identifiers
 and the actor (the decision maker on `decision` records, the canceller on
-`cancel`/`run_cancelled` records, `null` elsewhere)
+`cancel`/`run_cancelled` records, the pauser/resumer on
+`pause`/`run_paused`/`run_resumed` records, `null` elsewhere)
 — never params, results or error text; identifiers that do not apply are
 `null`. When one request causes several changes (e.g. two lease takeovers
 plus a claim), the records enter the stream in the order the changes
@@ -460,7 +464,7 @@ A step whose dependencies can never satisfy its trigger rule becomes
   lease per step.
 
 Run states: `pending` -> `running` -> `succeeded` | `failed`
-(`cancelled` via explicit cancel).
+(`cancelled` via explicit cancel; `paused` via explicit pause, resumable).
 
 - `pending` until a step is first claimed; `running` while work is outstanding.
 - `succeeded` when every step is `succeeded`.
@@ -468,6 +472,17 @@ Run states: `pending` -> `running` -> `succeeded` | `failed`
   approval is rejected.  Runs containing non-`all_success` trigger rules
   instead finish only when every node is terminal — see
   [Trigger rules](#trigger-rules-and-skipped-steps).
+- `paused` while frozen by the tenant: `pause` (only on `pending`/`running`)
+  revokes every running task's lease back to `ready` (attempt kept,
+  `worker_id`/`lease_deadline`/`next_attempt_at` cleared, one `pause` event
+  per revoked task in topological order) and appends a run-level
+  `run_paused` event with the actor.  Completed nodes, waiting approvals and
+  a not-yet-due `not_before` are preserved; nothing is opened, claimed or
+  retried while paused (claims return `None`/204, decisions conflict with
+  `run_paused`, `cancel` still applies).  `resume` (only on `paused`)
+  appends `run_resumed` and restores the derived `pending`/`running` status
+  without leasing, opening nodes or skipping `not_before`.  Repeats of both
+  are no-ops returning the current document.
 
 Every transition appends `{"at","run_id","step_id","type","attempt","worker_id"}`
 to the run's append-only history (a `decision` event additionally carries

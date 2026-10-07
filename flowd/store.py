@@ -26,6 +26,7 @@ from .model import KIND_TASK, TRIGGER_ALL_SUCCESS, WorkflowError, format_time, p
 
 RUN_PENDING = "pending"
 RUN_RUNNING = "running"
+RUN_PAUSED = "paused"
 RUN_SUCCEEDED = "succeeded"
 RUN_FAILED = "failed"
 RUN_CANCELLED = "cancelled"
