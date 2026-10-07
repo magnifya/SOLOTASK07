@@ -9,12 +9,19 @@ self/cyclic dependencies and bad ``max_attempts`` values.  Each step may
 also declare a ``trigger_rule`` — ``all_success`` (the default when the
 field is omitted), ``all_done`` or ``any_success`` — governing which
 dependency outcomes unlock it; any other value (including an explicit
-``null``) is rejected with ``bad_trigger_rule``.  A validated plan
+``null``) is rejected with ``bad_trigger_rule``.  A task step may also
+declare ``retry_backoff_seconds``, the per-step backoff base used instead
+of the scheduler default when a failure re-queues it; omitted or ``null``
+keeps the scheduler default, and anything that is not a finite positive
+int or float (booleans, strings, zero, negatives, ``NaN``, infinities) is
+rejected with ``bad_retry_backoff``, as is any non-null value on an
+approval step.  A validated plan
 is returned topologically sorted (ties broken by step id) so scheduling
 order is deterministic.
 """
 
 import heapq
+import math
 import time as _time
 
 STEP_STATES = ("pending", "ready", "running", "waiting", "succeeded", "failed", "cancelled",
@@ -100,8 +107,32 @@ def validate_step(raw, index, seen_ids):
         # Omitted means the legacy rule: unlock only when all dependencies
         # succeeded.  An explicit null is rejected like any other bad value.
         trigger_rule = TRIGGER_ALL_SUCCESS
+    retry_backoff = raw.get("retry_backoff_seconds")
+    if retry_backoff is not None:
+        if isinstance(retry_backoff, bool) or not isinstance(retry_backoff, (int, float)):
+            raise WorkflowError(
+                "step %s: retry_backoff_seconds must be a finite positive number or null"
+                % step_id,
+                "bad_retry_backoff",
+            )
+        try:
+            retry_backoff = float(retry_backoff)
+        except OverflowError:
+            retry_backoff = float("inf")
+        if not math.isfinite(retry_backoff) or retry_backoff <= 0:
+            raise WorkflowError(
+                "step %s: retry_backoff_seconds must be a finite positive number or null"
+                % step_id,
+                "bad_retry_backoff",
+            )
+        if kind == KIND_APPROVAL:
+            raise WorkflowError(
+                "step %s: approval steps cannot set retry_backoff_seconds" % step_id,
+                "bad_retry_backoff",
+            )
     return {"id": step_id, "depends_on": depends_on, "max_attempts": max_attempts,
-            "kind": kind, "trigger_rule": trigger_rule}
+            "kind": kind, "trigger_rule": trigger_rule,
+            "retry_backoff_seconds": retry_backoff}
 
 
 def topo_order(steps):

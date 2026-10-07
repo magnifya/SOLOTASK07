@@ -45,7 +45,9 @@ A step may set `"kind": "approval"` (default `"task"`) to insert a human gate;
 the only accepted values are `task` and `approval`.  A step may also set
 `"trigger_rule"` (default `"all_success"`); the accepted values are
 `all_success`, `all_done` and `any_success` (see
-[Trigger rules](#trigger-rules-and-skipped-steps)).
+[Trigger rules](#trigger-rules-and-skipped-steps)).  A task step may also set
+`"retry_backoff_seconds"`, a per-step backoff base for its retries (see
+[Per-step retry backoff](#per-step-retry-backoff)).
 
 ## HTTP API
 
@@ -530,10 +532,34 @@ exhausted retry or rejection fails it immediately.  Approvals, leases,
 retries, takeover, quotas, fair claim, delayed and periodic scheduling,
 idempotency, cancellation and the tenant audit stream are unchanged.
 
+### Per-step retry backoff
+
+A task step may declare `retry_backoff_seconds`, the backoff base used when
+a failure re-queues it: the first failure waits exactly that many seconds
+and each later failure waits the base times `2 ** (attempt - 1)`, replacing
+the scheduler's default base for that step only.  Omitting the field or
+passing `null` keeps the scheduler default, so existing workflows and runs
+are unaffected.  The value must be a finite positive int or float;
+booleans, strings, zero, negatives, `NaN` and infinities are rejected with
+400 (`bad_retry_backoff`), as is any non-null value on an approval step —
+the workflow is neither saved nor overwritten and no audit record is
+written.  A successful submission returns the normalized field, and the
+base is frozen into every run at creation time (manual, idempotent and
+periodic-schedule creations alike), so a later same-name submission cannot
+change an existing run's retry timing; run details, the listing and
+`flowd status` report the frozen base, and replay after a restart
+reproduces it.  Runs and workflows written before the field existed read
+back as `null` and keep the scheduler default.  The waiting step stays
+`ready` but cannot be leased — by the single-run claim or the tenant-wide
+fair claim — until `next_attempt_at` is reached, and it holds no
+concurrency quota while waiting; reaching `max_attempts` still fails the
+step immediately and clears `next_attempt_at`.
+
 ### Workflow versions and same-name submissions
 
 The normalized DAG definition used when a run is created — step order, node
-`kind`, dependencies and `max_attempts` — is snapshotted into the run
+`kind`, dependencies, `max_attempts` and retry backoff bases — is
+snapshotted into the run
 document (`plan`) at creation time and never changes afterwards. Submitting
 another workflow under the same `workflow_id` in the same tenant only
 governs runs created after that submission; it cannot rewrite an existing
