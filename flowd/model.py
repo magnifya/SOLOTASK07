@@ -19,7 +19,7 @@ import time as _time
 
 STEP_STATES = ("pending", "ready", "running", "waiting", "succeeded", "failed", "cancelled",
                "skipped")
-RUN_STATES = ("pending", "running", "succeeded", "failed", "cancelled")
+RUN_STATES = ("pending", "running", "succeeded", "failed", "cancelled", "paused")
 DEFAULT_MAX_ATTEMPTS = 3
 
 KIND_TASK = "task"

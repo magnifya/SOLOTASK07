@@ -29,6 +29,7 @@ RUN_RUNNING = "running"
 RUN_SUCCEEDED = "succeeded"
 RUN_FAILED = "failed"
 RUN_CANCELLED = "cancelled"
+RUN_PAUSED = "paused"
 
 STEP_PENDING = "pending"
 STEP_READY = "ready"

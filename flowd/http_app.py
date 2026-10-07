@@ -123,7 +123,9 @@ class _Handler(BaseHTTPRequestHandler):
             schedule_dispatch = re.fullmatch(r"/v1/schedules/([^/]+)/dispatch", path)
             if schedule_dispatch:
                 return self._dispatch_schedule(unquote(schedule_dispatch.group(1)), self._body())
-            action = re.fullmatch(r"/v1/runs/([^/]+)/(claim|complete|fail|decision|heartbeat|cancel)", path)
+            action = re.fullmatch(
+                r"/v1/runs/([^/]+)/(claim|complete|fail|decision|heartbeat|cancel|pause|resume)",
+                path)
             if action:
                 if action.group(2) == "decision":
                     return self._decision(action.group(1), self._body())
@@ -131,6 +133,10 @@ class _Handler(BaseHTTPRequestHandler):
                     return self._heartbeat(action.group(1), self._body())
                 if action.group(2) == "cancel":
                     return self._cancel(action.group(1), self._body())
+                if action.group(2) == "pause":
+                    return self._pause(action.group(1), self._body())
+                if action.group(2) == "resume":
+                    return self._resume(action.group(1), self._body())
                 return self._step_action(action.group(1), action.group(2), self._body())
         solo = re.fullmatch(r"/v1/runs/([^/]+)", path)
         if method == "GET" and solo:
@@ -292,6 +298,27 @@ class _Handler(BaseHTTPRequestHandler):
             raise WorkflowError("actor must be a non-empty string", "bad_actor")
         run = self.scheduler.cancel(tenant.strip(), run_id, actor.strip())
         return self._json(200, _run_view(run))
+
+    @staticmethod
+    def _tenant_actor(body):
+        """Strict tenant/actor validation shared by cancel/pause/resume."""
+        tenant = body.get("tenant")
+        if not isinstance(tenant, str) or not tenant.strip():
+            raise WorkflowError("tenant must be a non-empty string", "bad_tenant")
+        actor = body.get("actor")
+        if not isinstance(actor, str) or not actor.strip():
+            raise WorkflowError("actor must be a non-empty string", "bad_actor")
+        return tenant.strip(), actor.strip()
+
+    def _pause(self, run_id, body):
+        """Pause a pending/running run; a repeat pause is a no-op."""
+        tenant, actor = self._tenant_actor(body)
+        return self._json(200, _run_view(self.scheduler.pause(tenant, run_id, actor)))
+
+    def _resume(self, run_id, body):
+        """Resume a paused run; a repeat resume appends nothing."""
+        tenant, actor = self._tenant_actor(body)
+        return self._json(200, _run_view(self.scheduler.resume(tenant, run_id, actor)))
 
     def _decision(self, run_id, body):
         """Validate strictly; any missing/blank/wrong-type field is a 400."""
