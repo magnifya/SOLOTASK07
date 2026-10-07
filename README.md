@@ -55,6 +55,8 @@ the only accepted values are `task` and `approval`.  A step may also set
 | POST | `/v1/workflows` | 201 validated plan | 400 validation error, 400 bad JSON |
 | POST | `/v1/runs` | 201 run (new or replayed) | 400 bad request/max_parallelism/idempotency_key/params/not_before, 404 unknown workflow, 409 idempotency conflict |
 | GET | `/v1/runs/{run_id}?tenant=` | 200 run with step states | 400 missing tenant, 403 cross-tenant, 404 unknown run |
+| GET | `/v1/runs/{run_id}/history?tenant=&limit=&after=` | 200 `{"tenant","run_id","items","next_after"}` | 400 bad_tenant/bad_limit/bad_after, 403 cross-tenant, 404 unknown run |
+| GET | `/v1/runs/{run_id}/replay?tenant=` | 200 run projection rebuilt from the frozen DAG and history | 400 bad_tenant, 403 cross-tenant, 404 unknown run |
 | POST | `/v1/runs/{run_id}/claim` | 200 `{"step":...}`, 204 nothing ready | 400 bad request, 403 cross-tenant, 404 unknown run, 409 worker not registered/expired |
 | POST | `/v1/tasks/claim` | 200 `{"run_id":...,"step":...}`, 204 nothing claimable | 400 bad tenant/worker_id/lease_seconds/JSON, 409 worker not registered/expired |
 | POST | `/v1/runs/{run_id}/complete` | 200 updated run | 400 bad request, 403, 404 unknown step, 409 lease not held/expired |
@@ -127,6 +129,42 @@ the audit stream never touches runs, leases, history or `updated_at`, and
 a query only ever sees the requested tenant's own records — filters cannot
 probe other tenants. Run history, `Scheduler.history`/`Scheduler.replay`,
 the other HTTP routes, error statuses and the CLI output are unchanged.
+
+### Read-only run history and replay
+
+Two tenant-isolated GET endpoints expose the existing
+`Scheduler.history` / `Scheduler.replay` machinery; both are strictly
+read-only — they never create, activate, cancel, pause or modify a run and
+never write run files, history or audit records, so `updated_at`, leases,
+status and the audit stream are untouched by every outcome (including
+validation failures, unknown runs and cross-tenant reads).
+
+`GET /v1/runs/{run_id}/history?tenant=` pages through the run's append-only
+history (`Scheduler.history_page`). `tenant` is required, trimmed, and must
+be non-empty (`bad_tenant`); `limit` defaults to 100 and accepts only
+integers from 1 to 1000 (`bad_limit`); `after` defaults to 0 and accepts
+only non-negative integers (`bad_after`). Events are numbered by append
+position starting at 1; `after` is the ordinal of the last consumed event
+and only events after it are returned, in append order, with every original
+event object and its optional fields intact. The response is
+`{"tenant", "run_id", "items", "next_after"}`, where `next_after` is the
+ordinal of the page's last event, or `null` when no further events follow
+(including an empty page).
+
+`GET /v1/runs/{run_id}/replay?tenant=` returns 200 with the same run
+projection as `GET /v1/runs/{run_id}`, rebuilt from the frozen DAG and
+append history via `Scheduler.replay`: delayed start, retry waits, lease
+takeover, approvals, pause/resume and termination are all reconstructed
+with their times, attempt counts, results, errors and approval records. A
+later same-name workflow submission — or its deletion — cannot change the
+result; repeated requests, process restarts and not-yet-activation-time
+runs all return the identical projection without triggering activation
+(any extra query parameters such as `limit`/`after` are ignored).
+
+For both endpoints an unknown run returns 404 `unknown_run` and another
+tenant's run returns 403 `cross_tenant`; these checks happen before any
+state is read into a response, so a tenant cannot use either endpoint to
+probe runs it does not own.
 
 ### Tenant-wide fair claim
 

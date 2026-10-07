@@ -95,6 +95,16 @@ class _Handler(BaseHTTPRequestHandler):
                 # Blank values count as "provided" here: an empty tenant,
                 # action or run_id is a 400, not a missing parameter.
                 return self._list_audit(parse_qs(raw_query, keep_blank_values=True))
+            run_history = re.fullmatch(r"/v1/runs/([^/]+)/history", path)
+            if run_history:
+                # Blank values count as "provided": an empty tenant, limit or
+                # after is a 400 with its own code, not a defaulted parameter.
+                return self._get_run_history(
+                    parse_qs(raw_query, keep_blank_values=True), run_history.group(1))
+            run_replay = re.fullmatch(r"/v1/runs/([^/]+)/replay", path)
+            if run_replay:
+                return self._get_run_replay(
+                    parse_qs(raw_query, keep_blank_values=True), run_replay.group(1))
         elif method == "POST":
             if path == "/v1/tasks/claim":
                 return self._claim_any_task(self._body())
@@ -152,6 +162,30 @@ class _Handler(BaseHTTPRequestHandler):
         if owner is not None and owner != tenant:
             raise WorkflowError("run %s belongs to another tenant" % run_id, "cross_tenant")
         return self._json(200, _run_view(self.scheduler.get_run(tenant, run_id)))
+
+    def _get_run_history(self, query, run_id):
+        """Paginated run history for one tenant; strictly read-only."""
+        tenant = (query.get("tenant") or [None])[0]
+        if not isinstance(tenant, str) or not tenant.strip():
+            raise WorkflowError("tenant must be a non-empty string", "bad_tenant")
+        limit = self._query_int(query, "limit", 100, "bad_limit")
+        if not 1 <= limit <= 1000:
+            raise WorkflowError("limit must be an integer between 1 and 1000", "bad_limit")
+        after = self._query_int(query, "after", 0, "bad_after")
+        if after < 0:
+            raise WorkflowError("after must be a non-negative integer", "bad_after")
+        items, next_after = self.scheduler.history_page(
+            tenant.strip(), run_id, limit=limit, after=after)
+        return self._json(200, {"tenant": tenant.strip(), "run_id": run_id,
+                                "items": items, "next_after": next_after})
+
+    def _get_run_replay(self, query, run_id):
+        """Replay a run from its frozen DAG and history; writes nothing."""
+        tenant = (query.get("tenant") or [None])[0]
+        if not isinstance(tenant, str) or not tenant.strip():
+            raise WorkflowError("tenant must be a non-empty string", "bad_tenant")
+        run = self.scheduler.replay(tenant.strip(), run_id)
+        return self._json(200, _run_view(run))
 
     def _list_runs(self, query):
         tenant = self._tenant(query)

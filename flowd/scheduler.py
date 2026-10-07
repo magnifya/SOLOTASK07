@@ -647,6 +647,35 @@ class Scheduler:
                 raise WorkflowError("unknown run: %s" % run_id, "unknown_run")
         return list(self.get_run(tenant, run_id)["history"])
 
+    def history_page(self, tenant, run_id, limit=100, after=0):
+        """Read one page of the tenant's own run history; never mutates state.
+
+        Events keep their append order and are numbered by append position
+        starting at 1 (matching the audit stream's convention): ``after`` is
+        the ordinal of the last consumed event (0 = from the start) and only
+        events after it are returned, at most ``limit``.  Returns
+        ``(items, next_after)`` where ``next_after`` is the ordinal of the
+        page's last event when further events follow, or ``None`` on the last
+        page.  Read-only: no run field, lease, history or audit record is
+        written.  An unknown run is ``unknown_run``; another tenant's run is
+        ``cross_tenant``.
+        """
+        tenant = normalize_tenant(tenant)
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1000:
+            raise WorkflowError("limit must be an integer between 1 and 1000", "bad_limit")
+        if isinstance(after, bool) or not isinstance(after, int) or after < 0:
+            raise WorkflowError("after must be a non-negative integer", "bad_after")
+        with self.store.locked():
+            owner = self.store.run_exists(run_id)
+            if owner is None:
+                raise WorkflowError("unknown run: %s" % run_id, "unknown_run")
+            if owner != tenant:
+                raise WorkflowError("run %s belongs to another tenant" % run_id, "cross_tenant")
+            events = list(self.get_run(tenant, run_id)["history"])
+        page = events[after:after + limit]
+        next_after = after + len(page) if after + len(page) < len(events) else None
+        return page, next_after
+
     # -- periodic schedules -------------------------------------------
     def create_schedule(self, tenant, schedule_id, workflow_id, interval_seconds,
                         first_at=None, params=None, max_parallelism=None):
