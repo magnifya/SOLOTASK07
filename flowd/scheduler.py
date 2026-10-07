@@ -59,6 +59,9 @@ WORKER_ACTIVE = "active"
 WORKER_EXPIRED = "expired"
 DEFAULT_WORKER_LEASE = 30
 
+SCHEDULE_ACTIVE = "active"
+SCHEDULE_PAUSED = "paused"
+
 
 def backoff_seconds(attempt, base=1.0):
     """Exponential backoff: ``base * 2 ** (attempt - 1)``."""
@@ -669,6 +672,7 @@ class Scheduler:
                 "next_at": next_at,
                 "params": params,
                 "max_parallelism": max_parallelism,
+                "status": SCHEDULE_ACTIVE,
                 "created_at": self._iso(now),
                 "updated_at": self._iso(now),
             }
@@ -710,6 +714,12 @@ class Scheduler:
                 )
             schedules = self.store.load_schedules(tenant)
             record = schedules[schedule_id]
+            if record.get("status", SCHEDULE_ACTIVE) == SCHEDULE_PAUSED:
+                # Paused schedules never fire: no run, no next_at change, no
+                # audit record — regardless of whether a trigger is due.
+                raise ConflictError(
+                    "schedule %s is paused" % schedule_id, "schedule_paused"
+                )
             scheduled_at = float(record["next_at"])
             if now < scheduled_at:
                 return None, None
@@ -728,6 +738,68 @@ class Scheduler:
             self.store.append_audit(tenant, "schedule.dispatch", schedule_id=schedule_id,
                                     run_id=run["run_id"])
             return run, scheduled_at
+
+    def _set_schedule_status(self, tenant, schedule_id, actor, target, action):
+        """Shared pause/resume transition for a schedule.
+
+        Validates the identifiers, resolves ownership (``unknown_schedule``
+        / ``cross_tenant``) and flips the persisted ``status`` to ``target``.
+        A record already in the target state is returned unchanged: no
+        ``updated_at`` bump and no audit record.  A real transition updates
+        ``updated_at`` and appends one ``action`` audit record carrying the
+        actor.  Records written before ``status`` existed read as active.
+        """
+        tenant = normalize_tenant(tenant)
+        schedule_id = normalize_schedule_id(schedule_id)
+        actor = self._normalize_actor(actor)
+        with self.store.locked():
+            owner = self.store.schedule_exists(schedule_id)
+            if owner is None:
+                raise WorkflowError(
+                    "unknown schedule: %s" % schedule_id, "unknown_schedule"
+                )
+            if owner != tenant:
+                raise WorkflowError(
+                    "schedule %s belongs to another tenant" % schedule_id, "cross_tenant"
+                )
+            schedules = self.store.load_schedules(tenant)
+            record = schedules[schedule_id]
+            if record.get("status", SCHEDULE_ACTIVE) == target:
+                # Idempotent repeat: the stored record is returned as is.
+                return dict(record)
+            record["status"] = target
+            record["updated_at"] = self._iso()
+            schedules[schedule_id] = record
+            self.store.save_schedules(tenant, schedules)
+            self.store.append_audit(tenant, action, schedule_id=schedule_id, actor=actor)
+            return dict(record)
+
+    def pause_schedule(self, tenant, schedule_id, actor):
+        """Pause an active schedule; a repeat pause is a no-op.
+
+        Pausing only blocks future dispatches: the schedule, its ``next_at``
+        and every run it already created are kept exactly as stored.  The
+        transition sets ``status`` to ``paused``, refreshes ``updated_at``
+        and appends one ``schedule.pause`` audit record carrying the actor;
+        repeating the pause returns the current record without changing
+        ``updated_at`` or appending another audit record.
+        """
+        return self._set_schedule_status(
+            tenant, schedule_id, actor, SCHEDULE_PAUSED, "schedule.pause")
+
+    def resume_schedule(self, tenant, schedule_id, actor):
+        """Resume a paused schedule; a repeat resume is a no-op.
+
+        The schedule goes back to ``active`` with its original ``next_at``
+        preserved — resuming never creates a run itself; the next dispatch
+        simply fires the due trigger point and missed points are caught up
+        one per call in chronological order, exactly as before the pause.
+        The transition refreshes ``updated_at`` and appends one
+        ``schedule.resume`` audit record carrying the actor; repeating the
+        resume returns the current record unchanged.
+        """
+        return self._set_schedule_status(
+            tenant, schedule_id, actor, SCHEDULE_ACTIVE, "schedule.resume")
 
     # -- worker registry -----------------------------------------------
     def _worker_view(self, record, now=None):
