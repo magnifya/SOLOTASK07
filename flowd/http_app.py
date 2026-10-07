@@ -95,6 +95,15 @@ class _Handler(BaseHTTPRequestHandler):
                 # Blank values count as "provided" here: an empty tenant,
                 # action or run_id is a 400, not a missing parameter.
                 return self._list_audit(parse_qs(raw_query, keep_blank_values=True))
+            run_history = re.fullmatch(r"/v1/runs/([^/]+)/history", path)
+            if run_history:
+                # Same blank-value rule as /v1/audit.
+                return self._run_history(parse_qs(raw_query, keep_blank_values=True),
+                                         run_history.group(1))
+            run_replay = re.fullmatch(r"/v1/runs/([^/]+)/replay", path)
+            if run_replay:
+                return self._run_replay(parse_qs(raw_query, keep_blank_values=True),
+                                        run_replay.group(1))
         elif method == "POST":
             if path == "/v1/tasks/claim":
                 return self._claim_any_task(self._body())
@@ -195,6 +204,54 @@ class _Handler(BaseHTTPRequestHandler):
             tenant, action=action, run_id=run_id, limit=limit, after=after)
         return self._json(200, {"tenant": tenant.strip(), "items": items,
                                 "next_after": next_after})
+
+    # -- run history / replay (read-only) -------------------------------
+    @staticmethod
+    def _strict_tenant(query):
+        tenant = (query.get("tenant") or [None])[0]
+        if not isinstance(tenant, str) or not tenant.strip():
+            raise WorkflowError("tenant must be a non-empty string", "bad_tenant")
+        return tenant.strip()
+
+    def _run_owner(self, tenant, run_id):
+        """Resolve ownership: 404 for unknown runs, 403 for foreign ones."""
+        owner = self.scheduler.store.run_exists(run_id)
+        if owner is None:
+            raise WorkflowError("unknown run: %s" % run_id, "unknown_run")
+        if owner != tenant:
+            raise WorkflowError("run %s belongs to another tenant" % run_id, "cross_tenant")
+
+    def _run_history(self, query, run_id):
+        """Page through a run's append-only history; never mutates state.
+
+        ``after`` is the number of events already consumed (0 by default);
+        ``next_after`` is the position of the last event of this page, or
+        ``None`` when no further events follow.
+        """
+        tenant = self._strict_tenant(query)
+        limit = self._query_int(query, "limit", 100, "bad_limit")
+        if not 1 <= limit <= 1000:
+            raise WorkflowError("limit must be an integer between 1 and 1000", "bad_limit")
+        after = self._query_int(query, "after", 0, "bad_after")
+        if after < 0:
+            raise WorkflowError("after must be a non-negative integer", "bad_after")
+        self._run_owner(tenant, run_id)
+        events = self.scheduler.history(run_id, tenant=tenant)
+        matched = events[after:]
+        page = matched[:limit]
+        next_after = after + len(page) if len(matched) > limit else None
+        return self._json(200, {"tenant": tenant, "run_id": run_id, "items": page,
+                                "next_after": next_after})
+
+    def _run_replay(self, query, run_id):
+        """Rebuild the run projection from its frozen DAG and history.
+
+        Purely read-only: the rebuilt document is never persisted and no
+        audit record is appended, so repeating the request — even across
+        restarts or before a delayed run activates — yields the same body.
+        """
+        tenant = self._strict_tenant(query)
+        return self._json(200, _run_view(self.scheduler.replay(tenant, run_id)))
 
     # -- periodic schedules -------------------------------------------
     def _create_schedule(self, body):
